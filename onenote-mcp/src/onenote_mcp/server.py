@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+from bs4 import BeautifulSoup
 from typing import Annotated, Awaitable, Callable, Literal, TypeVar
 
 import anyio
@@ -16,7 +18,7 @@ from .auth import AuthError, Authenticator, SignInRequired
 from .compose import ContentError, Parts, attachment_tag, image_tag, markdown_to_html, page_html
 from .config import ConfigError, Flags, app_dir, load_flags, load_settings
 from .convert import render_page, render_structure
-from .editing import EditError, Editor
+from .editing import EditError, Editor, Prepared
 from .graph import GraphClient, GraphError
 from .state import EditState
 
@@ -150,12 +152,15 @@ class OneNoteService:
         target_id: str | None,
         build: Callable[[str | None, Parts], list[dict]],
         done: str,
+        check: Callable[["Prepared"], None] | None = None,
     ) -> str:
         """Apply commands to the page's working copy (made on first edit)."""
 
         async def run(graph: GraphClient) -> str:
             parts = Parts()
             prep = await self.editor.prepare(page_id, target_id)
+            if check:
+                check(prep)
             commands = build(prep.target, parts)
             await graph.update_page(prep.page_id, commands, parts.items)
             return "\n".join([*prep.notes, f"{done} (page id: {prep.page_id})."])
@@ -460,16 +465,38 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
         page_id: PageId,
         target_id: Annotated[str, Field(description="Element ID from get_page_structure")],
         content: Content,
+        allow_removing_images: Annotated[
+            bool, Field(description="Allow replacing an element that contains images or files "
+                                    "(they would be deleted)")
+        ] = False,
     ) -> str:
         """Replace one element (paragraph, heading, list, table, image or outline) with new
-        Markdown content. Use this to rewrite or reformat existing text.
+        Markdown content. Use this to rewrite or reformat existing text. Replace the smallest
+        element that holds the text: replacing an outline that also holds images would delete
+        them (refused unless allow_removing_images=true). OneNote may move the replaced
+        element within its outline, so check the result with get_page_content.
         Never changes an original page: if page_id is an original, the edit goes to its
         working copy (made on first edit as '<title> [edited]' in the same section). The
         result gives the ID of the page that was changed."""
+        def guard(prep: Prepared) -> None:
+            if allow_removing_images:
+                return
+            el = BeautifulSoup(prep.html, "html.parser").find(attrs={"id": prep.target})
+            if el is None:
+                return
+            n = len(el.find_all(["img", "object"])) + (1 if el.name in ("img", "object") else 0)
+            if n:
+                raise ToolError(
+                    f"That element contains {n} image(s)/file(s), which replacing it would delete. "
+                    "Target a smaller element (a paragraph, heading or list), or pass "
+                    "allow_removing_images=true if that's really intended."
+                )
+
         return await svc.edit(
             page_id, target_id,
             lambda t, parts: [{"target": t, "action": "replace", "content": markdown_to_html(content, parts)}],
             "Replaced the element",
+            check=guard,
         )
 
     @mcp.tool(annotations=CHANGES)

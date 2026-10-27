@@ -5,7 +5,7 @@ import pytest
 from onenote_mcp.editing import COPY_SUFFIX, EditError, Editor, find_placeholders
 from onenote_mcp.state import EditState
 
-from .fake_onenote import GRAPH, FakeOneNote
+from .fake_onenote import GRAPH, PNG, FakeOneNote
 
 
 @pytest.fixture
@@ -91,7 +91,10 @@ async def test_rebuild_creates_page_first_then_fills_placeholders(tmp_path):
     assert [c["target"] for c in cmds] == [f"p:{{{copy}}}{{2}}", f"p:{{{copy}}}{{3}}"]
     assert 'data-attachment="Topic_2.pdf"' in cmds[0]["content"] and 'data="name:file1"' in cmds[0]["content"]
     assert 'src="name:img2"' in cmds[1]["content"] and 'alt="pic"' in cmds[1]["content"]
-    assert {p.name: p.data for p in uploaded} == {"file1": b"%PDF", "img2": b"\x89PNG"}
+    # Types come from the bytes / OneNote's records, not the download's generic header.
+    assert {p.name: (p.data, p.content_type) for p in uploaded} == {
+        "file1": (b"%PDF-1.7", "application/pdf"), "img2": (PNG, "image/png")}
+    assert not job.problems
     assert fake.pages[copy]["title"] == "L2 (copy)"  # title metadata set explicitly
     assert state.copy_of(orig) == copy
     assert state.notes.get("exact_copy_unsupported") is None  # 400, not 501
@@ -275,3 +278,26 @@ async def test_restore_rebuilds_from_snapshot(setup):
     assert copy in job.message and "delete it" in job.message
     with pytest.raises(EditError):
         ed.start_restore(fake.add_page("Untouched", []))
+
+
+async def test_non_image_data_is_not_uploaded_and_check_warns(tmp_path):
+    fake = FakeOneNote(copy_supported=False)
+    real = fake.get_bytes
+
+    async def html_instead(url):
+        if url.endswith("r1/$value"):
+            return b"<html>error</html>", "text/html"
+        return await real(url)
+
+    fake.get_bytes = html_instead
+    ed = Editor(fake, EditState(tmp_path))
+    job = await finish(ed, ed.start_copy(fake.add_page("L2", ["x"])))
+    assert job.failed == 1 and "[Image 2 could not be copied]" in fake.pages[job.page_id]["paragraphs"]
+    assert job.message.startswith("⚠️") and "images" in job.message
+
+
+def test_sniff():
+    from onenote_mcp.editing import sniff
+
+    assert sniff(PNG) == "image/png" and sniff(b"\xff\xd8\xff\xe0") == "image/jpeg"
+    assert sniff(b"%PDF-1.4") == "application/pdf" and sniff(b"<html>") is None

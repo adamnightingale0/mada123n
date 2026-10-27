@@ -72,6 +72,10 @@ or decoration. Any other HTML is stripped before it reaches OneNote.
   59…]" placeholders, then downloads images and files six at a time and uploads them in
   batches of eight, replacing the placeholders. An image that genuinely can't be copied is
   marked on the page.
+  Each file's type is taken from its own bytes (and OneNote's records), not from the
+  download's generic header, and anything that isn't real image data isn't uploaded. When
+  the copy is done, the server downloads sample images back from it and checks for the
+  attached files; if something's wrong, the result starts with a ⚠️ warning.
 - **Unfinished copies are resumable.** If the connection drops, Claude Desktop restarts or
   the job is otherwise cut off, the copy keeps its remaining placeholders and is flagged as
   UNFINISHED in `list_pages`. Calling `copy_page` for the same original (or
@@ -241,10 +245,13 @@ The server uses MCP Python SDK 2.x. FastMCP was renamed `MCPServer` in that rele
 
 ## Logs
 
-Every Graph request is logged to stderr with its status and timing (writes and anything
-slower than 3 s at INFO), along with each copy job's steps. Claude Desktop saves this to
-`%APPDATA%\Claude\logs\mcp-server-onenote.log` (Windows) or
-`~/Library/Logs/Claude/mcp-server-onenote.log` (macOS). Logs contain page IDs and titles,
+Every Graph request is logged with its status and timing (writes and anything slower than
+3 s at INFO), along with each copy job's steps, including every image's size and detected
+type. The server writes its own log file, `server.log` in the app directory
+(`%LOCALAPPDATA%\onenote-mcp\server.log` on Windows,
+`~/Library/Application Support/onenote-mcp/server.log` on macOS; `onenote-mcp status`
+prints the path), and also logs to stderr, which Claude Desktop may keep in its own logs
+folder. Logs contain page IDs and titles,
 not page content. Set `ONENOTE_LOG_LEVEL=DEBUG` to log every request.
 
 ## Errors and throttling

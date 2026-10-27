@@ -39,6 +39,15 @@ def _transient(exc: GraphError) -> bool:
     return exc.status is None or exc.status == 429 or exc.status >= 500
 
 
+def _warning(job: "CopyJob") -> str:
+    if not job.problems:
+        return ""
+    return (
+        "⚠️ The copy finished, but a check found problems: " + "; ".join(job.problems)
+        + ". Look at the copy in OneNote before relying on it."
+    )
+
+
 INTERRUPTED_HINT = (
     "The copy stopped partway ({detail}). The page keeps its remaining placeholders; call "
     "copy_page again for the same original (or get_copy_status for this job) to finish it."
@@ -50,6 +59,7 @@ class Prepared:
     page_id: str  # the page the edit is applied to
     target: str | None
     notes: list[str]
+    html: str = ""  # the page before the edit, with element IDs
 
 
 def _is_graph_url(url: str | None) -> bool:
@@ -62,6 +72,29 @@ class _Resource:
     url: str
     attrs: dict
     number: int
+    mime: str = ""  # type OneNote recorded for it (data-src-type), if any
+
+
+_MAGIC = [
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+    (b"II*\x00", "image/tiff"),
+    (b"MM\x00*", "image/tiff"),
+    (b"%PDF", "application/pdf"),
+]
+
+
+def sniff(data: bytes) -> str | None:
+    """Content type from a file's first bytes; None if unrecognised."""
+    for magic, mime in _MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def placeholder_text(kind: str, number: int, total: int) -> str:
@@ -84,12 +117,17 @@ def collect_resources(html: str) -> tuple[BeautifulSoup, list[_Resource]]:
     resources: list[_Resource] = []
     placeholders = []
     for el in soup.find_all(["img", "object"]):
-        url = (el.get("src") or el.get("data-fullres-src")) if el.name == "img" else el.get("data")
+        if el.name == "img":
+            url, mime = el.get("src"), el.get("data-src-type") or ""
+            if not _is_graph_url(url):
+                url, mime = el.get("data-fullres-src"), el.get("data-fullres-src-type") or ""
+        else:
+            url, mime = el.get("data"), el.get("type") or ""
         if not _is_graph_url(url):
             continue
         keep = ("alt", "width", "height", "style") if el.name == "img" else (
             "data-attachment", "type", "style")
-        res = _Resource(el.name, url, {k: el[k] for k in keep if el.get(k)}, len(resources) + 1)
+        res = _Resource(el.name, url, {k: el[k] for k in keep if el.get(k)}, len(resources) + 1, mime)
         resources.append(res)
         ph = soup.new_tag("p")
         el.replace_with(ph)
@@ -132,6 +170,7 @@ class CopyJob:
     done: int = 0
     failed: int = 0
     note: str = ""
+    problems: list = field(default_factory=list)
     message: str = ""
     error: str = ""
     started_at: float = field(default_factory=time.time)
@@ -175,7 +214,7 @@ class CopyJob:
             out += f" The new page already exists (id: {self.page_id}) and is filling in."
         return out + (
             " It continues in the background even if this chat is interrupted. Call "
-            f"get_copy_status with job_id {self.id!r} to follow it; don't start another copy."
+            f"get_copy_status with job_id {self.id!r} to follow it; don't start it again."
         )
 
     def line(self) -> str:
@@ -330,7 +369,8 @@ class Editor:
             self._persist(job)
             role = self._register_copy(job)  # registered now, so a retry can't duplicate it
             await self._set_title(job, meta)
-            await self._fill_placeholders(job, resources)
+            if resources:
+                await self._fill_placeholders(job, resources)
 
         what = (
             "an exact copy (slide printouts, images, attachments and ink included)"
@@ -338,6 +378,7 @@ class Editor:
             else f"a rebuilt copy with {job.done - job.failed} of {job.total} images/files"
         )
         job.message = " ".join(x for x in (
+            _warning(job),
             f"Made {what}: '{job.title}' (id: {job.page_id}).",
             f"{job.failed} image(s)/file(s) couldn't be copied and are marked on the page."
             if job.failed else "",
@@ -397,13 +438,24 @@ class Editor:
         async def fetch(res: _Resource):
             async with sem:
                 try:
-                    data, ctype = await self.graph.get_bytes(res.url)
-                    return res, data, ctype.split(";")[0]
+                    data, header = await self.graph.get_bytes(res.url)
                 except GraphError as exc:
                     if _transient(exc):
                         raise
                     log.warning("Couldn't download %s %d: %s", res.kind, res.number, exc)
                     return res, None, str(exc)
+                header = header.split(";")[0].strip()
+                detected = sniff(data)
+                log.info("Downloaded %s %d: %d bytes, header %s, recorded %s, detected %s",
+                         res.kind, res.number, len(data), header, res.mime or "-", detected or "-")
+                if res.kind == "img":
+                    if not (detected or "").startswith("image/"):
+                        log.warning("%s %d isn't image data; first bytes: %r",
+                                    res.kind, res.number, data[:120])
+                        return res, None, "not image data"
+                    return res, data, detected
+                ctype = res.mime or detected or header or "application/octet-stream"
+                return res, data, ctype
 
         for i in range(0, len(todo), BATCH_MAX_ITEMS):
             chunk = todo[i:i + BATCH_MAX_ITEMS]
@@ -427,11 +479,47 @@ class Editor:
                 await self._fill(job, batch)
             self._persist(job)
         job.stage = "checking the copy"
-        left = find_placeholders(await self.graph.page_content(job.page_id, include_ids=True))
+        html = await self.graph.page_content(job.page_id, include_ids=True)
+        left = find_placeholders(html)
         if left:
             raise EditError(INTERRUPTED_HINT.format(
                 detail=f"{len(left)} image(s)/file(s) still to copy"))
+        job.problems = await self._verify(html, resources)
+        if job.problems:
+            log.warning("Copy check found problems: %s", "; ".join(job.problems))
         job.stage = "finished"
+
+    async def _verify(self, html: str, resources: list[_Resource]) -> list[str]:
+        """Download a few images back from the copy and check they are real images."""
+        soup = BeautifulSoup(html, "html.parser")
+        imgs = [i for i in soup.find_all("img") if _is_graph_url(i.get("src"))]
+        objects = [o for o in soup.find_all("object") if _is_graph_url(o.get("data"))]
+        problems = []
+        want_imgs = sum(1 for r in resources if r.kind == "img")
+        want_objects = len(resources) - want_imgs
+        if want_objects and not objects:
+            problems.append(f"the copy has no attached files, but the original has {want_objects}")
+        sample = sorted({0, len(imgs) // 2, len(imgs) - 1}) if imgs else []
+        bad = 0
+        for i in sample:
+            try:
+                data, header = await self.graph.get_bytes(imgs[i]["src"])
+            except GraphError as exc:
+                if _transient(exc):
+                    raise
+                bad += 1
+                log.warning("Check: image %d on the copy can't be downloaded: %s", i + 1, exc)
+                continue
+            detected = sniff(data)
+            log.info("Check: image %d on the copy: %d bytes, header %s, detected %s",
+                     i + 1, len(data), header, detected or "-")
+            if not (detected or "").startswith("image/"):
+                bad += 1
+        if bad:
+            problems.append(f"{bad} of {len(sample)} sampled images on the copy aren't readable images")
+        if want_imgs and len(imgs) < want_imgs:
+            problems.append(f"the copy shows {len(imgs)} images, the original {want_imgs}")
+        return problems
 
     async def _fill(self, job: CopyJob, items: list[tuple[_Resource, str, bytes | None, str]]) -> None:
         commands, parts = [], []
@@ -441,7 +529,7 @@ class Editor:
                 job.failed += 1
                 continue
             name = f"{'img' if res.kind == 'img' else 'file'}{res.number}"
-            parts.append(Part(name, data, ctype if res.kind == "img" else res.attrs.get("type", ctype)))
+            parts.append(Part(name, data, ctype))
             tag = BeautifulSoup("", "html.parser").new_tag(res.kind, attrs=dict(res.attrs))
             tag["src" if res.kind == "img" else "data"] = f"name:{name}"
             commands.append({"target": target, "action": "replace", "content": str(tag)})
@@ -499,13 +587,15 @@ class Editor:
         )
 
         async def work(job: CopyJob) -> None:
+            if not job.title:
+                job.title = (await self.graph.page(page_id)).get("title") or ""
             kind, ref = job.html_source.split(":", 1)
             src = await self.graph.page_content(ref) if kind == "page" else self.state.load_snapshot(ref)
             if src is None:
                 raise EditError("The snapshot this page was restored from is gone; it can't be finished.")
             _, resources = collect_resources(src)
             await self._fill_placeholders(job, resources)
-            job.message = (
+            job.message = _warning(job) + (" " if job.problems else "") + (
                 f"Finished copying the remaining images/files into '{job.title or 'the copy'}' "
                 f"(id: {page_id}): {job.done - job.failed} of {job.total} in place"
                 + (f", {job.failed} couldn't be copied and are marked on the page" if job.failed else "")
@@ -564,10 +654,10 @@ class Editor:
         self.state.save_snapshot(working, html)
 
         if target in (None, "title", "body"):
-            return Prepared(working, target, notes)
+            return Prepared(working, target, notes, html)
         structure = page_structure(html)
         if any(e.target == target for e in structure):
-            return Prepared(working, target, notes)
+            return Prepared(working, target, notes, html)
         if original:
             # The ID came from the original page; find the same element in the copy.
             orig = page_structure(await self.graph.page_content(original, include_ids=True))
@@ -575,7 +665,7 @@ class Editor:
             if idx is not None and idx < len(structure):
                 cand = structure[idx]
                 if cand.tag == orig[idx].tag and cand.preview == orig[idx].preview:
-                    return Prepared(working, cand.target, notes)
+                    return Prepared(working, cand.target, notes, html)
         raise EditError(
             f"Element {target!r} isn't on the working page (id: {working}). Call "
             "get_page_structure with that page ID to get current element IDs."
@@ -621,8 +711,9 @@ class Editor:
                 self.state.add_created(job.page_id)
             self._persist(job)
             await self._set_title(job, meta)
-            await self._fill_placeholders(job, resources)
-            job.message = (
+            if resources:
+                await self._fill_placeholders(job, resources)
+            job.message = _warning(job) + (" " if job.problems else "") + (
                 f"Restored '{job.title}' as it was before the last edit, as a new page (id: "
                 f"{job.page_id}) in the same section"
                 + (f"; {job.failed} image(s)/file(s) couldn't be copied" if job.failed else "")

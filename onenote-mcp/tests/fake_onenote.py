@@ -6,10 +6,14 @@ import itertools
 from onenote_mcp.graph import GraphError
 
 GRAPH = "https://graph.microsoft.com/v1.0"
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
 
 
 def page_doc(title, paragraphs, prefix):
-    body = "".join(f'<p id="p:{{{prefix}}}{{{i}}}">{t}</p>' for i, t in enumerate(paragraphs, 1))
+    body = "".join(
+        t if t.startswith("<") else f'<p id="p:{{{prefix}}}{{{i}}}">{t}</p>'
+        for i, t in enumerate(paragraphs, 1)
+    )
     return f'<html><head><title>{title}</title></head><body><div id="div:{{{prefix}}}{{0}}">{body}</div></body></html>'
 
 
@@ -45,11 +49,12 @@ class FakeOneNote:
         html = page_doc(p["title"], p["paragraphs"], page_id)
         if not include_ids:
             html = html.replace(' id="', ' data-x="')
-        return html + (
+        extra = (
             f'<object data-attachment="Topic_2.pdf" type="application/pdf" '
             f'data="{GRAPH}/me/onenote/resources/r2/$value"></object>'
             f'<img src="{GRAPH}/me/onenote/resources/r1/$value" alt="pic">'
         )
+        return html.replace("</div></body>", extra + "</div></body>")
 
     async def copy_page(self, page_id, section_id, timeout=90.0, on_wait=None):
         if not self.copy_supported:
@@ -87,16 +92,19 @@ class FakeOneNote:
                 p["title"] = c["content"]
             elif c["action"] == "replace" and target.startswith(f"p:{{{page_id}}}"):
                 k = int(target.rsplit("{", 1)[1].rstrip("}"))
-                text = BeautifulSoup(c["content"], "html.parser").get_text() or "<filled>"
-                p["paragraphs"][k - 1] = text
+                soup = BeautifulSoup(c["content"], "html.parser")
+                for el in soup.find_all(["img", "object"]):  # stored as a page resource
+                    attr = "src" if el.name == "img" else "data"
+                    el[attr] = f"{GRAPH}/me/onenote/resources/{page_id}-{el[attr][5:]}/$value"
+                p["paragraphs"][k - 1] = str(soup) if soup.find(["img", "object"]) else soup.get_text()
 
     async def get_bytes(self, url):
         self.downloads.append(url)
         if any(url.endswith(f"{r}/$value") for r in self.fail_downloads):
             raise GraphError("Not found (HTTP 404).", 404)
-        if url.endswith("r2/$value"):
-            return b"%PDF", "application/pdf"
-        return b"\x89PNG", "image/png"
+        if url.endswith("r2/$value") or "-file" in url:
+            return b"%PDF-1.7", "application/octet-stream"
+        return PNG, "application/octet-stream"
 
     async def delete_page(self, page_id):
         self._get(page_id)

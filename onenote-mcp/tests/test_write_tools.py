@@ -169,3 +169,17 @@ async def test_job_list_and_unfinished_marker(tmp_path):
         r = await c.call_tool("copy_page", {"page_id": orig})
         assert "being completed" in text(r) and "Finished copying" in text(r)
     assert len(fake.pages) == 2
+
+
+async def test_replace_refuses_to_delete_images(tmp_path):
+    fake, state, server = make(tmp_path)
+    orig = fake.add_page("L2", ["notes"])
+    async with Client(server) as c:
+        await c.call_tool("copy_page", {"page_id": orig})
+        copy = state.copy_of(orig)
+        div = f"div:{{{copy}}}{{0}}"
+        r = await c.call_tool("replace_content", {"page_id": copy, "target_id": div, "content": "x"})
+        assert r.is_error and "would delete" in text(r)
+        r = await c.call_tool("replace_content", {"page_id": copy, "target_id": f"p:{{{copy}}}{{1}}",
+                                                  "content": "fine"})
+        assert not r.is_error

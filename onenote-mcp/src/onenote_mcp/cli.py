@@ -25,6 +25,22 @@ def _setup_logging() -> None:
     )
     for noisy in ("httpx", "httpcore", "msal"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Also log to a file in the app directory: some clients (e.g. the Claude app's
+    # device bridge) don't keep the server's stderr anywhere you can find it.
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Can't write log file: %s", exc)
+
+
+def log_path() -> Path:
+    return app_dir() / "server.log"
 
 
 def cmd_serve(_: argparse.Namespace) -> int:
@@ -57,6 +73,7 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"Client ID:   {settings.client_id}")
     print(f"Authority:   {settings.authority_url}")
     print(f"Token cache: {settings.token_cache_path}")
+    print(f"Log file:    {log_path()}")
     mode = "read-only"
     if settings.flags.allow_write:
         mode = "read/write" + (" + delete" if settings.flags.allow_delete else "")
