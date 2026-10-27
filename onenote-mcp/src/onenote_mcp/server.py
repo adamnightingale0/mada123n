@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated, Awaitable, Callable, Literal, TypeVar
 
@@ -48,6 +49,9 @@ text-decoration. Other HTML is removed.
   titled "<title> [edited]", and edits that.) Tell the user the copy's name.
 - Never rebuild an existing page with create_page; it can't carry over images,
   printouts or attachments. Use copy_page.
+- Copying a large page (e.g. lecture slides) runs in the background. If copy_page says the
+  job is still running, call get_copy_status with its job_id until it finishes; tell the
+  user what it reports. Don't call copy_page again for the same page meanwhile.
 - To change specific text, call get_page_structure first and use an element ID as
   target_id. Prefer replacing individual elements over rewriting the whole page.
 - Before each edit the server saves one snapshot of the page; restore_previous_version
@@ -162,6 +166,28 @@ class OneNoteService:
 def _link(page: dict) -> str:
     href = ((page.get("links") or {}).get("oneNoteClientUrl") or {}).get("href")
     return f"\nOpen in OneNote: {href}" if href else ""
+
+
+# How long copy/restore tools wait for their background job before reporting progress.
+TOOL_WAIT = 25.0
+
+
+async def _wait_and_report(g: GraphClient, job, seconds: float) -> str:
+    if job.task and not job.task.done() and seconds > 0:
+        await asyncio.wait({job.task}, timeout=seconds)
+    return await _job_result(g, job)
+
+
+async def _job_result(g: GraphClient, job) -> str:
+    if job.status == "failed":
+        raise ToolError(job.summary())
+    out = job.summary()
+    if job.status == "done" and job.page_id:
+        try:
+            out += _link(await g.page(job.page_id))
+        except GraphError:
+            pass
+    return out
 
 
 def _fmt_date(value: str | None) -> str:
@@ -340,16 +366,50 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
             str | None, Field(description="Section for the copy (default: same section)")
         ] = None,
         new_title: Annotated[str | None, Field(description="Default: '<title> (copy)'")] = None,
+        allow_duplicate: Annotated[
+            bool, Field(description="Make another copy even if this page already has a working copy")
+        ] = False,
     ) -> str:
-        """Duplicate a page, including slide printouts, images, attached files and ink. Does
-        not change the original. Use this before editing an existing page: the first copy of a
-        page becomes its working copy. Returns the new page's ID."""
+        """Duplicate a page, including slide printouts, images, attached files and ink, without
+        changing the original. Use this before editing an existing page: the first copy of a
+        page becomes its working copy. Large pages are copied in the background: if the result
+        says the job is still running, follow it with get_copy_status instead of retrying.
+        Calling this again for the same page returns the running job or the existing copy."""
 
         async def run(g: GraphClient) -> str:
-            copy_id, message = await svc.editor.copy_page(page_id, target_section_id, new_title)
-            return message + _link(await g.page(copy_id))
+            ed = svc.editor
+            existing = ed.state.copy_of(page_id)
+            if existing and not allow_duplicate and not ed.running_job_for(page_id):
+                try:
+                    meta = await g.page(existing)
+                    return (
+                        f"This page already has a working copy: '{meta.get('title')}' (id: {existing}). "
+                        "Edit that, or pass allow_duplicate=true to make another copy." + _link(meta)
+                    )
+                except GraphError as exc:
+                    if exc.status != 404:
+                        raise
+                    ed.state.forget(existing)
+            job = await ed.wait(ed.start_copy(page_id, target_section_id, new_title), TOOL_WAIT)
+            return await _job_result(g, job)
 
         return await svc.call(run)
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def get_copy_status(
+        job_id: Annotated[str, Field(description="Job ID from copy_page or restore_previous_version")],
+        wait_seconds: Annotated[
+            int, Field(ge=0, le=50, description="Wait up to this long for the job to finish")
+        ] = 20,
+    ) -> str:
+        """Check a background copy or restore job: progress while it runs, then the new page."""
+        job = svc.editor.jobs.get(job_id)
+        if job is None:
+            raise ToolError(
+                f"No job {job_id!r}. The server may have restarted (jobs stop when Claude Desktop "
+                "closes); check list_pages for the copy before starting another."
+            )
+        return await svc.call(lambda g: _wait_and_report(g, job, wait_seconds))
 
     @mcp.tool(annotations=ADDS)
     async def add_content(page_id: PageId, content: Content, position: Pos = "end",
@@ -432,8 +492,13 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
     @mcp.tool(annotations=ADDS)
     async def restore_previous_version(page_id: PageId) -> str:
         """Undo the most recent edit by rebuilding the page from the snapshot taken just
-        before it, as a new page in the same section."""
-        return await svc.call(lambda g: svc.editor.restore(page_id))
+        before it, as a new page in the same section. Runs in the background like copy_page;
+        follow it with get_copy_status if it's still running."""
+        async def run(g: GraphClient) -> str:
+            job = await svc.editor.wait(svc.editor.start_restore(page_id), TOOL_WAIT)
+            return await _job_result(g, job)
+
+        return await svc.call(run)
 
     if flags.allow_delete:
 

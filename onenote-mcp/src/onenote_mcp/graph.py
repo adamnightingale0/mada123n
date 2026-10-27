@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -135,8 +136,10 @@ class GraphClient:
         retryable = RETRY_STATUSES if method in ("GET", "DELETE") else {429}
         refreshed = False
         attempt = 0
+        path = url.removeprefix(GRAPH_BASE)
         while True:
             token = await self._token(refreshed)
+            started = time.monotonic()
             try:
                 resp = await self._http.request(
                     method,
@@ -146,6 +149,7 @@ class GraphClient:
                     **body,
                 )
             except httpx.TimeoutException as exc:
+                log.warning("%s %s timed out after %.1fs", method, path, time.monotonic() - started)
                 raise GraphError(
                     "Microsoft Graph timed out. OneNote can be slow; try again, or ask for "
                     "a smaller set of items."
@@ -155,6 +159,11 @@ class GraphClient:
             except httpx.HTTPError as exc:
                 raise GraphError(f"Could not reach Microsoft Graph: {exc}") from exc
 
+            elapsed = time.monotonic() - started
+            log.log(
+                logging.INFO if method != "GET" or elapsed > 3 or not resp.is_success else logging.DEBUG,
+                "%s %s -> %s in %.1fs", method, path, resp.status_code, elapsed,
+            )
             if resp.status_code == 401 and not refreshed:
                 refreshed = True
                 continue
@@ -306,8 +315,18 @@ class GraphClient:
     async def delete_page(self, page_id: str) -> None:
         await self._request(f"/me/onenote/pages/{segment(page_id)}", method="DELETE")
 
-    async def copy_page(self, page_id: str, section_id: str, timeout: float = 120.0) -> str:
-        """Copy a page server-side (full fidelity) and return the new page's ID."""
+    async def copy_page(
+        self,
+        page_id: str,
+        section_id: str,
+        timeout: float = 90.0,
+        on_wait: Callable[[float], None] | None = None,
+    ) -> str:
+        """Copy a page server-side (full fidelity) and return the new page's ID.
+
+        Raises GraphError if OneNote refuses, reports failure, or hasn't finished
+        within ``timeout`` seconds (status 408 in that case).
+        """
         resp = await self._request(
             f"/me/onenote/pages/{segment(page_id)}/copyToSection",
             method="POST",
@@ -319,13 +338,17 @@ class GraphClient:
             if not op_id:
                 raise GraphError("Microsoft Graph accepted the copy but gave no way to track it.")
             op_url = f"/me/onenote/operations/{segment(op_id)}"
+        start = time.monotonic()
         waited = 0.0
         delay = 1.0
-        while waited < timeout:
+        while max(waited, time.monotonic() - start) < timeout:
             await self._sleep(delay)
             waited += delay
+            if on_wait:
+                on_wait(max(waited, time.monotonic() - start))
             op = await self.get_json(op_url)
             status = (op.get("status") or "").lower()
+            log.info("copyToSection operation status: %s", status or op)
             if status == "completed":
                 new_id = op.get("resourceId")
                 if not new_id:
@@ -333,6 +356,6 @@ class GraphClient:
                 return new_id
             if status == "failed":
                 detail = (op.get("error") or {}).get("message") or "no details"
-                raise GraphError(f"Copying the page failed: {detail}")
+                raise GraphError(f"OneNote's copy failed: {detail}", 500)
             delay = min(delay * 1.5, 5.0)
-        raise GraphError("Copying the page is taking too long; check OneNote for a copy before retrying.")
+        raise GraphError(f"OneNote's copy didn't finish within {timeout:.0f} seconds.", 408)

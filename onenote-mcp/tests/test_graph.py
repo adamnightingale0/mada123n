@@ -184,3 +184,18 @@ async def test_create_page_plain_html_and_patch_json():
     await client.update_page("new", [{"target": "title", "action": "replace", "content": "T"}], [])
     assert create.calls[0].request.headers["Content-Type"] == "text/html"
     assert patch.calls[0].request.headers["Content-Type"] == "application/json"
+
+
+@respx.mock
+async def test_copy_page_gives_up_with_408():
+    respx.post(f"{GRAPH_BASE}/me/onenote/pages/p1/copyToSection").mock(
+        return_value=httpx.Response(202, json={"id": "op1"})
+    )
+    respx.get(f"{GRAPH_BASE}/me/onenote/operations/op1").mock(
+        return_value=httpx.Response(200, json={"status": "Running"})
+    )
+    client, _, _ = make_client()
+    waits = []
+    with pytest.raises(GraphError) as exc:
+        await client.copy_page("p1", "s1", timeout=10, on_wait=waits.append)
+    assert exc.value.status == 408 and waits and waits[-1] >= 10

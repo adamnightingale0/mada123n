@@ -1,5 +1,6 @@
 """In-memory stand-in for GraphClient's OneNote calls, for editing tests."""
 
+import asyncio
 import itertools
 
 from onenote_mcp.graph import GraphError
@@ -13,8 +14,11 @@ def page_doc(title, paragraphs, prefix):
 
 
 class FakeOneNote:
-    def __init__(self, copy_supported=True):
+    def __init__(self, copy_supported=True, copy_delay=0.0, fail_downloads=()):
         self.copy_supported = copy_supported
+        self.copy_delay = copy_delay
+        self.fail_downloads = set(fail_downloads)
+        self.downloads = []
         self._ids = itertools.count(1)
         self.pages = {}  # id -> {"title", "section", "paragraphs"}
         self.updates = []  # (page_id, commands, parts)
@@ -47,9 +51,13 @@ class FakeOneNote:
             f'<img src="{GRAPH}/me/onenote/resources/r1/$value" alt="pic">'
         )
 
-    async def copy_page(self, page_id, section_id):
+    async def copy_page(self, page_id, section_id, timeout=90.0, on_wait=None):
         if not self.copy_supported:
             raise GraphError("Copy not supported (HTTP 400).", 400)
+        if self.copy_delay:
+            if on_wait:
+                on_wait(0)
+            await asyncio.sleep(self.copy_delay)
         p = self._get(page_id)
         return self.add_page(p["title"], p["paragraphs"], section_id)
 
@@ -69,8 +77,15 @@ class FakeOneNote:
         for c in commands:
             if c["target"] == "title" and c["action"] == "replace":
                 p["title"] = c["content"]
+            elif c["target"].startswith("#onenote-mcp-pending-") and c["action"] == "replace":
+                n = c["target"].rsplit("-", 1)[1]
+                p["paragraphs"] = [t for t in p["paragraphs"]
+                                   if not (t.startswith("[Copying") and f" {n} of " in t)]
 
     async def get_bytes(self, url):
+        self.downloads.append(url)
+        if any(url.endswith(f"{r}/$value") for r in self.fail_downloads):
+            raise GraphError("Not found (HTTP 404).", 404)
         if url.endswith("r2/$value"):
             return b"%PDF", "application/pdf"
         return b"\x89PNG", "image/png"

@@ -119,3 +119,23 @@ async def test_copy_page_tool_and_page_markers(tmp_path):
         listing = text(await c.call_tool("list_pages", {"section_id": "sec1"}))
     assert f"original, edits go to working copy {copy}" in listing
     assert f"working copy of {orig}" in listing
+
+
+async def test_copy_page_runs_in_background_and_is_retry_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr("onenote_mcp.server.TOOL_WAIT", 0.05)
+    fake, state, server = make(tmp_path)
+    fake.copy_delay = 0.3
+    orig = fake.add_page("L2", ["notes"])
+    async with Client(server) as c:
+        first = text(await c.call_tool("copy_page", {"page_id": orig}))
+        assert "still running" in first and "get_copy_status" in first
+        job_id = first.split("job_id '")[1].split("'")[0]
+        again = text(await c.call_tool("copy_page", {"page_id": orig}))
+        assert job_id in again  # joined the running job, no second copy
+        done = text(await c.call_tool("get_copy_status", {"job_id": job_id, "wait_seconds": 5}))
+        assert "exact copy" in done and "Open in OneNote" in done
+        third = text(await c.call_tool("copy_page", {"page_id": orig}))
+        assert "already has a working copy" in third
+        r = await c.call_tool("get_copy_status", {"job_id": "copy-99"})
+        assert r.is_error and "restarted" in text(r)
+    assert len(fake.pages) == 2

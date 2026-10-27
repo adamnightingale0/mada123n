@@ -33,7 +33,8 @@ Turn editing on with `ONENOTE_ALLOW_WRITE=1` (or `"allow_write": true` in `confi
 
 | Tool | What it does |
 | --- | --- |
-| `copy_page(page_id, target_section_id, new_title)` | Duplicate a page with everything on it (slide printouts, images, attachments, ink). The first copy of a page becomes its working copy |
+| `copy_page(page_id, target_section_id, new_title, allow_duplicate)` | Duplicate a page with everything on it (slide printouts, images, attachments, ink). The first copy of a page becomes its working copy. Big pages copy in the background |
+| `get_copy_status(job_id, wait_seconds)` | Progress of a background copy or restore, then the new page |
 | `create_page(section_id, title, content)` | New page from Markdown |
 | `create_section(notebook_id, name)` | New section |
 | `add_content(page_id, content, position, target_id)` | Add Markdown at the end or start of the page, or before/after an element |
@@ -60,6 +61,16 @@ or decoration. Any other HTML is stripped before it reaches OneNote.
   that feature isn't available to your account, the server rebuilds the copy from the page's
   HTML instead, re-uploading every image and attached file (including PDF printouts), and
   says so; that version loses ink.
+- **Copies run as background jobs.** `copy_page` waits about 25 s; if the copy isn't
+  done by then it returns a job ID, and `get_copy_status` reports progress (e.g. "copying
+  images and files (16/50)"). The job keeps going if the chat is stopped, and calling
+  `copy_page` again for the same page joins the running job (or returns the existing copy)
+  instead of making a duplicate. Jobs stop if Claude Desktop is closed.
+  - OneNote's exact copy gets 90 s. If it's refused or slower than that, the server
+    rebuilds the page: it creates the copy straight away with "[Copying image 3 of 50…]"
+    placeholders, then downloads images and files six at a time and uploads them in
+    batches of eight, replacing the placeholders. Anything that can't be copied is
+    marked on the page.
 - **The original→copy link is remembered** in `edit_state.json` in the app directory, so
   later chats keep editing the same copy. `list_pages` marks originals, working copies and
   pages Claude created. If you delete the copy in OneNote, the next edit
@@ -221,6 +232,14 @@ OneNote HTML, images/files), `editing.py` (copy on first edit, snapshots, restor
 
 The server uses MCP Python SDK 2.x. FastMCP was renamed `MCPServer` in that release
 (`from mcp.server.mcpserver import MCPServer`), with the same decorator-based API.
+
+## Logs
+
+Every Graph request is logged to stderr with its status and timing (writes and anything
+slower than 3 s at INFO), along with each copy job's steps. Claude Desktop saves this to
+`%APPDATA%\Claude\logs\mcp-server-onenote.log` (Windows) or
+`~/Library/Logs/Claude/mcp-server-onenote.log` (macOS). Logs contain page IDs and titles,
+not page content. Set `ONENOTE_LOG_LEVEL=DEBUG` to log every request.
 
 ## Errors and throttling
 
