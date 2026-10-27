@@ -94,6 +94,8 @@ def _error_for(resp: httpx.Response) -> GraphError:
             + (f"; it asked to wait {wait} seconds" if wait else "")
             + ". Wait a little and retry, and avoid fetching many pages in a row."
         )
+    elif status == 501:
+        text = "Microsoft Graph doesn't support this for your account or notebook (HTTP 501)."
     elif status >= 500:
         text = f"Microsoft Graph had a server error (HTTP {status}). Try again shortly."
     else:

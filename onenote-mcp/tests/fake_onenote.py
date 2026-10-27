@@ -72,15 +72,23 @@ class FakeOneNote:
         return {"id": pid}
 
     async def update_page(self, page_id, commands, parts):
+        from bs4 import BeautifulSoup
+
         p = self._get(page_id)
+        for c in commands:
+            target = c["target"]
+            if c["action"] == "replace" and target.startswith("#"):
+                # Like OneNote: paragraphs can only be replaced by their generated id.
+                raise GraphError("Bad request (HTTP 400). Details: invalid target", 400)
         self.updates.append((page_id, commands, parts))
         for c in commands:
-            if c["target"] == "title" and c["action"] == "replace":
+            target = c["target"]
+            if target == "title" and c["action"] == "replace":
                 p["title"] = c["content"]
-            elif c["target"].startswith("#onenote-mcp-pending-") and c["action"] == "replace":
-                n = c["target"].rsplit("-", 1)[1]
-                p["paragraphs"] = [t for t in p["paragraphs"]
-                                   if not (t.startswith("[Copying") and f" {n} of " in t)]
+            elif c["action"] == "replace" and target.startswith(f"p:{{{page_id}}}"):
+                k = int(target.rsplit("{", 1)[1].rstrip("}"))
+                text = BeautifulSoup(c["content"], "html.parser").get_text() or "<filled>"
+                p["paragraphs"][k - 1] = text
 
     async def get_bytes(self, url):
         self.downloads.append(url)

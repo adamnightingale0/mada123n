@@ -24,17 +24,26 @@ class EditState:
         self.snapshot_dir = base / "snapshots"
         self.copies: dict[str, str] = {}
         self.created: set[str] = set()
+        self.jobs: dict[str, dict] = {}
+        self.notes: dict[str, object] = {}  # learned facts, e.g. exact copy unsupported
         if self.path.exists():
             restrict_permissions(self.path)
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 self.copies = dict(data.get("copies", {}))
                 self.created = set(data.get("created", []))
+                self.jobs = dict(data.get("jobs", {}))
+                self.notes = dict(data.get("notes", {}))
             except (OSError, ValueError) as exc:
                 log.warning("Ignoring unreadable edit state %s: %s", self.path, exc)
 
     def _save(self) -> None:
-        data = {"copies": self.copies, "created": sorted(self.created)}
+        data = {
+            "copies": self.copies,
+            "created": sorted(self.created),
+            "jobs": self.jobs,
+            "notes": self.notes,
+        }
         write_private(self.path, json.dumps(data, indent=2))
 
     # -- working pages -----------------------------------------------------
@@ -62,6 +71,21 @@ class EditState:
         self.created.discard(page_id)
         self._save()
         self.snapshot_path(page_id).unlink(missing_ok=True)
+
+    # -- jobs and notes ------------------------------------------------------
+
+    MAX_JOBS = 30
+
+    def save_job(self, record: dict) -> None:
+        self.jobs[record["id"]] = record
+        if len(self.jobs) > self.MAX_JOBS:  # keep the most recent
+            for old in sorted(self.jobs, key=lambda k: self.jobs[k].get("started_at", 0))[:-self.MAX_JOBS]:
+                del self.jobs[old]
+        self._save()
+
+    def set_note(self, key: str, value: object) -> None:
+        self.notes[key] = value
+        self._save()
 
     # -- snapshots ---------------------------------------------------------
 

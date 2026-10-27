@@ -169,13 +169,16 @@ def _link(page: dict) -> str:
 
 
 # How long copy/restore tools wait for their background job before reporting progress.
-TOOL_WAIT = 25.0
+TOOL_WAIT = 8.0  # well inside the 60 s some clients allow a tool call
 
 
-async def _wait_and_report(g: GraphClient, job, seconds: float) -> str:
+async def _wait_and_report(g: GraphClient, job, seconds: float, resumed_from=None) -> str:
     if job.task and not job.task.done() and seconds > 0:
         await asyncio.wait({job.task}, timeout=seconds)
-    return await _job_result(g, job)
+    prefix = ""
+    if resumed_from is not None and resumed_from is not job:
+        prefix = f"Job {resumed_from.id} had stopped; resumed it as job {job.id}. "
+    return prefix + await _job_result(g, job)
 
 
 async def _job_result(g: GraphClient, job) -> str:
@@ -253,7 +256,10 @@ def build_server(service: OneNoteService | None = None, flags: Flags | None = No
         for p in pages:
             role = ""
             if state:
-                if (orig := state.original_of(p["id"])):
+                job = svc.editor.latest_job_for_page(p["id"])
+                if job and job.status != "done":
+                    role = f"; UNFINISHED COPY ({job.status} {job.progress()}, job {job.id})"
+                elif (orig := state.original_of(p["id"])):
                     role = f"; working copy of {orig}"
                 elif (copy := state.copy_of(p["id"])):
                     role = f"; original, edits go to working copy {copy}"
@@ -370,26 +376,36 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
             bool, Field(description="Make another copy even if this page already has a working copy")
         ] = False,
     ) -> str:
-        """Duplicate a page, including slide printouts, images, attached files and ink, without
+        """Duplicate a page, including slide printouts, images and attached files, without
         changing the original. Use this before editing an existing page: the first copy of a
-        page becomes its working copy. Large pages are copied in the background: if the result
-        says the job is still running, follow it with get_copy_status instead of retrying.
-        Calling this again for the same page returns the running job or the existing copy."""
+        page becomes its working copy. Copies run in the background and this returns within
+        seconds: if it says the job is still running, follow it with get_copy_status.
+        Calling it again for the same page is safe: it returns the running job, finishes an
+        interrupted copy, or reports the existing copy."""
 
         async def run(g: GraphClient) -> str:
             ed = svc.editor
+            running = ed.running_job_for(page_id)
+            if running:
+                return await _job_result(g, await ed.wait(running, TOOL_WAIT))
             existing = ed.state.copy_of(page_id)
-            if existing and not allow_duplicate and not ed.running_job_for(page_id):
+            if existing and not allow_duplicate:
                 try:
                     meta = await g.page(existing)
-                    return (
-                        f"This page already has a working copy: '{meta.get('title')}' (id: {existing}). "
-                        "Edit that, or pass allow_duplicate=true to make another copy." + _link(meta)
-                    )
                 except GraphError as exc:
                     if exc.status != 404:
                         raise
                     ed.state.forget(existing)
+                else:
+                    job = await ed.ensure_filled(existing)
+                    if job:
+                        return "The working copy was unfinished, so it's being completed. " + (
+                            await _job_result(g, await ed.wait(job, TOOL_WAIT)))
+                    return (
+                        f"This page already has a working copy: '{meta.get('title') or '(untitled)'}' "
+                        f"(id: {existing}). Edit that, or pass allow_duplicate=true to make another "
+                        "copy." + _link(meta)
+                    )
             job = await ed.wait(ed.start_copy(page_id, target_section_id, new_title), TOOL_WAIT)
             return await _job_result(g, job)
 
@@ -397,19 +413,34 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
 
     @mcp.tool(annotations=READ_ONLY)
     async def get_copy_status(
-        job_id: Annotated[str, Field(description="Job ID from copy_page or restore_previous_version")],
+        job_id: Annotated[
+            str | None, Field(description="Job ID from copy_page or restore_previous_version; "
+                                          "omit to list recent jobs")
+        ] = None,
         wait_seconds: Annotated[
-            int, Field(ge=0, le=50, description="Wait up to this long for the job to finish")
+            int, Field(ge=0, le=45, description="Wait up to this long for the job to finish")
         ] = 20,
     ) -> str:
-        """Check a background copy or restore job: progress while it runs, then the new page."""
-        job = svc.editor.jobs.get(job_id)
+        """Check a background copy or restore job: progress while it runs, then the new page.
+        An interrupted job (e.g. after a restart) is resumed. Without job_id, lists recent jobs."""
+        ed = svc.editor
+        if not job_id:
+            jobs = ed.recent_jobs()
+            return "Recent copy jobs (newest first):\n" + "\n".join(
+                f"- {j.line()}" for j in jobs) if jobs else "No copy jobs yet."
+        job = ed.jobs.get(job_id)
         if job is None:
-            raise ToolError(
-                f"No job {job_id!r}. The server may have restarted (jobs stop when Claude Desktop "
-                "closes); check list_pages for the copy before starting another."
-            )
-        return await svc.call(lambda g: _wait_and_report(g, job, wait_seconds))
+            raise ToolError(f"No job {job_id!r}. Call get_copy_status without job_id to list jobs.")
+
+        async def run(g: GraphClient) -> str:
+            current = job
+            if job.status in ("interrupted", "failed") and job.page_id:
+                resumed = await ed.ensure_filled(job.page_id)
+                if resumed:
+                    current = resumed
+            return await _wait_and_report(g, current, wait_seconds, resumed_from=job)
+
+        return await svc.call(run)
 
     @mcp.tool(annotations=ADDS)
     async def add_content(page_id: PageId, content: Content, position: Pos = "end",

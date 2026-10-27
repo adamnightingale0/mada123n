@@ -40,6 +40,7 @@ class _OneNoteConverter(MarkdownConverter):
         super().__init__(**options)
         self.image_count = 0
         self.image_text: list[tuple[int, str]] = []
+        self.include_image_text = True
 
     def convert_img(self, el, text, parent_tags=None, **kwargs):
         self.image_count += 1
@@ -50,7 +51,7 @@ class _OneNoteConverter(MarkdownConverter):
         if len(alt) <= INLINE_ALT_CHARS:
             return f" [Image {n}: {alt}] "
         self.image_text.append((n, alt))
-        return f" [Image {n}, text below] "
+        return f" [Image {n}, text below] " if self.include_image_text else f" [Image {n}] "
 
 
 def _tag_prefix(value: str) -> str:
@@ -119,6 +120,7 @@ def html_to_markdown(html: str, image_text: bool = True) -> tuple[str, str | Non
         heading_style="ATX", bullets="-", table_infer_header=True, escape_underscores=False,
         strip=["span", "font"],
     )
+    conv.include_image_text = image_text
     md = conv.convert_soup(body)
     md = md.replace(" ", " ")
     md = re.sub(r"[ \t]+\n", "\n", md)

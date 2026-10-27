@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from onenote_mcp.editing import COPY_SUFFIX, PLACEHOLDER_PREFIX, EditError, Editor
+from onenote_mcp.editing import COPY_SUFFIX, EditError, Editor, find_placeholders
 from onenote_mcp.state import EditState
 
 from .fake_onenote import GRAPH, FakeOneNote
@@ -82,16 +82,38 @@ async def test_rebuild_creates_page_first_then_fills_placeholders(tmp_path):
     assert job.method == "rebuilt" and "ink" in job.message and "2 of 2" in job.message
     section, html, parts = fake.created[0]
     # Created without any uploads: just placeholders where the PDF and slide were.
-    assert parts == [] and section == "sec1" and ' id="' not in html
-    assert html.count(f'data-id="{PLACEHOLDER_PREFIX}') == 2 and "[Copying file 1 of 2…]" in html
-    page_id, commands, uploaded = fake.updates[-1]
-    assert page_id == job.page_id
-    assert [c["target"] for c in commands] == [f"#{PLACEHOLDER_PREFIX}1", f"#{PLACEHOLDER_PREFIX}2"]
-    assert all(c["action"] == "replace" for c in commands)
-    assert 'data-attachment="Topic_2.pdf"' in commands[0]["content"] and 'data="name:file1"' in commands[0]["content"]
-    assert 'src="name:img2"' in commands[1]["content"] and 'alt="pic"' in commands[1]["content"]
+    assert parts == [] and section == "sec1" and ' id="' not in html and 'name="created"' not in html
+    assert "[Copying file 1 of 2…]" in html and "[Copying image 2 of 2…]" in html
+    # Placeholders are replaced via OneNote's generated ids (data-id is refused for <p>).
+    copy = job.page_id
+    fills = [(cmds, up) for pid, cmds, up in fake.updates if pid == copy and cmds[0]["target"] != "title"]
+    cmds, uploaded = fills[0]
+    assert [c["target"] for c in cmds] == [f"p:{{{copy}}}{{2}}", f"p:{{{copy}}}{{3}}"]
+    assert 'data-attachment="Topic_2.pdf"' in cmds[0]["content"] and 'data="name:file1"' in cmds[0]["content"]
+    assert 'src="name:img2"' in cmds[1]["content"] and 'alt="pic"' in cmds[1]["content"]
     assert {p.name: p.data for p in uploaded} == {"file1": b"%PDF", "img2": b"\x89PNG"}
-    assert state.copy_of(orig) == job.page_id
+    assert fake.pages[copy]["title"] == "L2 (copy)"  # title metadata set explicitly
+    assert state.copy_of(orig) == copy
+    assert state.notes.get("exact_copy_unsupported") is None  # 400, not 501
+
+
+async def test_501_is_remembered_and_exact_copy_skipped(tmp_path):
+    from onenote_mcp.graph import GraphError
+
+    fake = FakeOneNote()
+    calls = []
+
+    async def unsupported(page_id, section_id, timeout=90.0, on_wait=None):
+        calls.append(page_id)
+        raise GraphError("Not supported (HTTP 501). Details: OData Feature not implemented.", 501)
+
+    fake.copy_page = unsupported
+    state = EditState(tmp_path)
+    ed = Editor(fake, state)
+    job = await finish(ed, ed.start_copy(fake.add_page("A", ["x"])))
+    assert "isn't available for this account" in job.message and state.notes["exact_copy_unsupported"]
+    await finish(ed, Editor(fake, EditState(tmp_path)).start_copy(fake.add_page("B", ["y"])))
+    assert len(calls) == 1  # remembered across restarts
 
 
 async def test_rebuild_marks_images_that_fail(tmp_path):
@@ -99,22 +121,84 @@ async def test_rebuild_marks_images_that_fail(tmp_path):
     ed = Editor(fake, EditState(tmp_path))
     job = await finish(ed, ed.start_copy(fake.add_page("L2", ["x"])))
     assert job.failed == 1 and "couldn't be copied" in job.message
-    contents = [c["content"] for _, cmds, _ in fake.updates for c in cmds]
-    assert any("[Image 2 could not be copied]" in c for c in contents)
+    assert "[Image 2 could not be copied]" in fake.pages[job.page_id]["paragraphs"]
 
 
-async def test_rebuild_batches_many_images(tmp_path, monkeypatch):
+async def test_rebuild_batches_many_images(tmp_path):
     fake = FakeOneNote(copy_supported=False)
     many = "".join(f'<img src="{GRAPH}/me/onenote/resources/s{i}/$value" alt="slide {i}">' for i in range(20))
+    original_content = fake.page_content
+    big = fake.add_page("Big", [])
 
     async def content(page_id, include_ids=False):
-        return f"<html><head><title>Big</title></head><body><div>{many}<p>notes</p></div></body></html>"
+        if page_id == big:
+            return f"<html><head><title>Big</title></head><body><div>{many}<p>notes</p></div></body></html>"
+        return await original_content(page_id, include_ids)
 
     fake.page_content = content
     ed = Editor(fake, EditState(tmp_path))
-    job = await finish(ed, ed.start_copy(fake.add_page("Big", [])))
-    batches = [cmds for _, cmds, _ in fake.updates if cmds[0]["target"].startswith("#")]
+    job = await finish(ed, ed.start_copy(big))
+    batches = [cmds for pid, cmds, _ in fake.updates if pid == job.page_id and cmds[0]["target"] != "title"]
     assert [len(b) for b in batches] == [8, 8, 4] and job.total == 20 and job.done == 20
+    assert not find_placeholders(await fake.page_content(job.page_id, include_ids=True))
+
+
+async def test_unfinished_copy_is_resumed_after_restart(tmp_path):
+    fake = FakeOneNote(copy_supported=False)
+    state = EditState(tmp_path)
+    ed = Editor(fake, state)
+    orig = fake.add_page("L2", ["notes"])
+
+    async def broken(*a, **k):
+        raise GraphError("connection dropped", None)
+
+    from onenote_mcp.graph import GraphError
+
+    real_get_bytes, fake.get_bytes = fake.get_bytes, broken
+    real_update = fake.update_page
+
+    async def no_fill(page_id, commands, parts):  # the network dies before any upload
+        if commands[0]["target"] != "title":
+            raise GraphError("connection dropped", None)
+        await real_update(page_id, commands, parts)
+
+    fake.update_page = no_fill
+    job = await ed.wait(ed.start_copy(orig), 5)
+    copy = job.page_id
+    assert find_placeholders(await fake.page_content(copy, include_ids=True))
+
+    # "Restart": a fresh editor sees the saved job as unfinished...
+    fake.get_bytes, fake.update_page = real_get_bytes, real_update
+    ed2 = Editor(fake, EditState(tmp_path))
+    assert job.status == "failed" and "call copy_page again" in job.summary()
+    assert ed2.jobs[job.id].status == "failed"
+    # ...and an edit resumes the fill before touching the page.
+    prep = await ed2.prepare(orig, None)
+    resumed = ed2.latest_job_for_page(copy)
+    assert resumed.id != job.id and resumed.status == "done" and "Finished copying" in resumed.message
+    assert prep.page_id == copy
+    assert not find_placeholders(await fake.page_content(copy, include_ids=True))
+    assert len(fake.pages) == 2
+
+
+async def test_edit_waits_while_copy_is_filling(tmp_path, monkeypatch):
+    monkeypatch.setattr("onenote_mcp.editing.AUTO_COPY_WAIT", 0.05)
+    fake = FakeOneNote(copy_supported=False)
+    real_get_bytes = fake.get_bytes
+
+    async def slow(url):
+        await asyncio.sleep(0.3)
+        return await real_get_bytes(url)
+
+    fake.get_bytes = slow
+    ed = Editor(fake, EditState(tmp_path))
+    orig = fake.add_page("L2", ["x"])
+    with pytest.raises(EditError, match="still running"):
+        await ed.prepare(orig, None)
+    job = ed.running_job_for(orig)
+    with pytest.raises(EditError, match="still being copied in"):
+        await ed.prepare(job.page_id, None)
+    await finish(ed, job)
 
 
 async def test_job_survives_cancelled_waiter_and_dedupes(tmp_path):
@@ -185,7 +269,8 @@ async def test_restore_rebuilds_from_snapshot(setup):
     job = await finish(ed, ed.start_restore(orig))
     restored = state.copy_of(orig)
     assert restored == job.page_id and restored not in (orig, copy)
-    assert fake.pages[restored]["paragraphs"] == ["good"]
+    assert fake.pages[restored]["paragraphs"][0] == "good"
+    assert not find_placeholders(await fake.page_content(restored, include_ids=True))
     assert fake.pages[restored]["title"] == "Notes" + COPY_SUFFIX
     assert copy in job.message and "delete it" in job.message
     with pytest.raises(EditError):

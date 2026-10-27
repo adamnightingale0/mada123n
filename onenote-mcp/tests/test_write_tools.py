@@ -137,5 +137,35 @@ async def test_copy_page_runs_in_background_and_is_retry_safe(tmp_path, monkeypa
         third = text(await c.call_tool("copy_page", {"page_id": orig}))
         assert "already has a working copy" in third
         r = await c.call_tool("get_copy_status", {"job_id": "copy-99"})
-        assert r.is_error and "restarted" in text(r)
+        assert r.is_error and "without job_id" in text(r)
+    assert len(fake.pages) == 2
+
+
+async def test_job_list_and_unfinished_marker(tmp_path):
+    from onenote_mcp.graph import GraphError
+
+    fake, state, server = make(tmp_path)
+    fake.copy_supported = False
+    orig = fake.add_page("L2", ["notes"])
+
+    async def offline(url):
+        raise GraphError("connection dropped", None)
+
+    real_get_bytes, fake.get_bytes = fake.get_bytes, offline
+
+    async def section_pages(section_id, max_items):
+        return [{"id": pid, "title": p["title"]} for pid, p in fake.pages.items()], False
+
+    fake.section_pages = section_pages
+    async with Client(server) as c:
+        r = await c.call_tool("copy_page", {"page_id": orig})
+        assert r.is_error and "call copy_page again" in text(r)
+        jobs = text(await c.call_tool("get_copy_status", {}))
+        assert "copy · failed" in jobs
+        listing = text(await c.call_tool("list_pages", {"section_id": "sec1"}))
+        assert "UNFINISHED COPY (failed" in listing
+
+        fake.get_bytes = real_get_bytes  # back online: copy_page finishes the same page
+        r = await c.call_tool("copy_page", {"page_id": orig})
+        assert "being completed" in text(r) and "Finished copying" in text(r)
     assert len(fake.pages) == 2

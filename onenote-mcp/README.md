@@ -61,16 +61,22 @@ or decoration. Any other HTML is stripped before it reaches OneNote.
   that feature isn't available to your account, the server rebuilds the copy from the page's
   HTML instead, re-uploading every image and attached file (including PDF printouts), and
   says so; that version loses ink.
-- **Copies run as background jobs.** `copy_page` waits about 25 s; if the copy isn't
-  done by then it returns a job ID, and `get_copy_status` reports progress (e.g. "copying
-  images and files (16/50)"). The job keeps going if the chat is stopped, and calling
-  `copy_page` again for the same page joins the running job (or returns the existing copy)
-  instead of making a duplicate. Jobs stop if Claude Desktop is closed.
-  - OneNote's exact copy gets 90 s. If it's refused or slower than that, the server
-    rebuilds the page: it creates the copy straight away with "[Copying image 3 of 50…]"
-    placeholders, then downloads images and files six at a time and uploads them in
-    batches of eight, replacing the placeholders. Anything that can't be copied is
-    marked on the page.
+- **Copies run as background jobs.** `copy_page` returns within about 8 s; if the copy
+  isn't done by then it gives a job ID, and `get_copy_status` reports progress (e.g.
+  "copying images and files (16/59)"). Without a job ID, `get_copy_status` lists recent jobs.
+  The job keeps going if the chat is stopped, and calling `copy_page` again for the same page
+  joins the running job or returns the existing copy instead of making a duplicate.
+- **How a copy is made.** OneNote's exact copy is tried first (90 s limit). Personal
+  (consumer) notebooks don't support it (Graph answers HTTP 501); the server remembers that
+  and goes straight to rebuilding: it creates the copy at once with "[Copying image 3 of
+  59…]" placeholders, then downloads images and files six at a time and uploads them in
+  batches of eight, replacing the placeholders. An image that genuinely can't be copied is
+  marked on the page.
+- **Unfinished copies are resumable.** If the connection drops, Claude Desktop restarts or
+  the job is otherwise cut off, the copy keeps its remaining placeholders and is flagged as
+  UNFINISHED in `list_pages`. Calling `copy_page` for the same original (or
+  `get_copy_status` for the job) finishes it from where it stopped, by matching the
+  placeholders to the original's images. Edits wait until a copy is complete.
 - **The original→copy link is remembered** in `edit_state.json` in the app directory, so
   later chats keep editing the same copy. `list_pages` marks originals, working copies and
   pages Claude created. If you delete the copy in OneNote, the next edit
