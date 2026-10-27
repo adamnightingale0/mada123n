@@ -57,7 +57,10 @@ def text(result):
 async def test_exposes_read_only_tools():
     async with Client(server()) as c:
         tools = {t.name: t for t in (await c.list_tools()).tools}
-    assert set(tools) == {"list_notebooks", "list_sections", "list_pages", "get_page_content", "search_pages"}
+    assert set(tools) == {
+        "list_notebooks", "list_sections", "list_pages", "get_page_content", "search_pages",
+        "get_page_structure",
+    }
     assert all(t.annotations.read_only_hint for t in tools.values())
 
 

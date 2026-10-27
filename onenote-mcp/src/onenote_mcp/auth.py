@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import sys
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +10,8 @@ from typing import Any, Callable
 
 import msal
 
-from .config import GRAPH_SCOPES, Settings
+from .config import Settings
+from .files import restrict_permissions, write_private
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +38,7 @@ class PersistentTokenCache(msal.SerializableTokenCache):
         # Not "_lock": msal.TokenCache already uses that name internally.
         self._file_lock = threading.Lock()
         if path.exists():
-            _restrict_permissions(path)
+            restrict_permissions(path)
             try:
                 self.deserialize(path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
@@ -50,7 +48,7 @@ class PersistentTokenCache(msal.SerializableTokenCache):
         with self._file_lock:
             if not self.has_state_changed:
                 return
-            _write_private(self.path, self.serialize())
+            write_private(self.path, self.serialize())
             self.has_state_changed = False
 
     def clear(self) -> None:
@@ -61,35 +59,6 @@ class PersistentTokenCache(msal.SerializableTokenCache):
                 self.path.unlink()
             except FileNotFoundError:
                 pass
-
-
-def _restrict_permissions(path: Path) -> None:
-    if sys.platform == "win32":
-        return
-    try:
-        os.chmod(path, 0o600)
-    except OSError as exc:
-        log.warning("Could not restrict permissions on %s: %s", path, exc)
-
-
-def _write_private(path: Path, data: str) -> None:
-    """Atomically write ``data`` to ``path`` with owner-only permissions."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if sys.platform != "win32":
-        os.chmod(path.parent, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".token_cache.", suffix=".tmp")
-    try:
-        if sys.platform != "win32":
-            os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(data)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 @dataclass
@@ -132,7 +101,7 @@ class Authenticator:
         accounts = self.app.get_accounts()
         if accounts:
             result = self.app.acquire_token_silent(
-                GRAPH_SCOPES, account=accounts[0], force_refresh=force_refresh
+                self.settings.scopes, account=accounts[0], force_refresh=force_refresh
             )
             self.cache.save()
             if result and "access_token" in result:
@@ -148,7 +117,7 @@ class Authenticator:
     # -- device code flow --------------------------------------------------
 
     def _initiate(self) -> tuple[dict, DeviceCodePrompt]:
-        flow = self.app.initiate_device_flow(scopes=GRAPH_SCOPES)
+        flow = self.app.initiate_device_flow(scopes=self.settings.scopes)
         if "user_code" not in flow:
             raise AuthError(
                 "Could not start Microsoft sign-in: "

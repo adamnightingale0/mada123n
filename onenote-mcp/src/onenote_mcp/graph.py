@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
@@ -19,6 +21,15 @@ MAX_RETRIES = 3
 MAX_RETRY_WAIT = 30.0
 
 TokenProvider = Callable[[bool], Awaitable[str]]
+
+
+@dataclass
+class Part:
+    """A binary part (image or file) sent alongside page HTML in a multipart request."""
+
+    name: str
+    data: bytes
+    content_type: str
 
 
 class GraphError(Exception):
@@ -67,7 +78,8 @@ def _error_for(resp: httpx.Response) -> GraphError:
     elif status == 403:
         text = (
             "Access denied by Microsoft Graph (HTTP 403). Check that the app registration "
-            "has the delegated Notes.Read permission and that you consented to it."
+            "has the delegated Notes.Read permission (Notes.ReadWrite for editing) and that you "
+            "consented to it; after adding a permission, run `onenote-mcp logout` and `login`."
         )
     elif status == 404:
         text = (
@@ -104,21 +116,41 @@ class GraphClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _request(self, url: str, params: dict[str, Any] | None = None) -> httpx.Response:
+    async def _request(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        **body: Any,
+    ) -> httpx.Response:
+        """Send a request with auth, retrying throttling and transient errors.
+
+        Writes (POST/PATCH) are retried only on 429, which Graph sends before
+        doing any work; a 5xx on a write may have half-applied, so retrying it
+        could duplicate content.
+        """
         if not url.startswith("https://"):
             url = GRAPH_BASE + url
+        retryable = RETRY_STATUSES if method in ("GET", "DELETE") else {429}
         refreshed = False
         attempt = 0
         while True:
             token = await self._token(refreshed)
             try:
-                resp = await self._http.get(
-                    url, params=params, headers={"Authorization": f"Bearer {token}"}
+                resp = await self._http.request(
+                    method,
+                    url,
+                    params=params,
+                    headers={**(headers or {}), "Authorization": f"Bearer {token}"},
+                    **body,
                 )
             except httpx.TimeoutException as exc:
                 raise GraphError(
                     "Microsoft Graph timed out. OneNote can be slow; try again, or ask for "
                     "a smaller set of items."
+                    + (" Check the page before retrying: the change may have been applied."
+                       if method != "GET" else "")
                 ) from exc
             except httpx.HTTPError as exc:
                 raise GraphError(f"Could not reach Microsoft Graph: {exc}") from exc
@@ -126,7 +158,7 @@ class GraphClient:
             if resp.status_code == 401 and not refreshed:
                 refreshed = True
                 continue
-            if resp.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
+            if resp.status_code in retryable and attempt < MAX_RETRIES:
                 wait = _retry_after(resp, attempt)
                 log.warning("Graph returned %s; retrying in %.1fs", resp.status_code, wait)
                 attempt += 1
@@ -145,6 +177,10 @@ class GraphClient:
 
     async def get_text(self, url: str, params: dict[str, Any] | None = None) -> str:
         return (await self._request(url, params)).text
+
+    async def get_bytes(self, url: str) -> tuple[bytes, str]:
+        resp = await self._request(url)
+        return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
     async def get_collection(
         self, url: str, params: dict[str, Any] | None = None, max_items: int = 500
@@ -225,5 +261,78 @@ class GraphClient:
             max_items=max_items,
         )
 
-    async def page_content(self, page_id: str) -> str:
-        return await self.get_text(f"/me/onenote/pages/{segment(page_id)}/content")
+    async def page_content(self, page_id: str, include_ids: bool = False) -> str:
+        params = {"includeIDs": "true"} if include_ids else None
+        return await self.get_text(f"/me/onenote/pages/{segment(page_id)}/content", params)
+
+    async def page(self, page_id: str) -> dict:
+        return await self.get_json(
+            f"/me/onenote/pages/{segment(page_id)}",
+            {"$select": "id,title", "$expand": "parentSection($select=id,displayName)"},
+        )
+
+    # -- writes ------------------------------------------------------------
+
+    async def create_section(self, notebook_id: str, name: str) -> dict:
+        resp = await self._request(
+            f"/me/onenote/notebooks/{segment(notebook_id)}/sections",
+            method="POST",
+            json={"displayName": name},
+        )
+        return resp.json()
+
+    async def create_page(self, section_id: str, html: str, parts: list[Part]) -> dict:
+        url = f"/me/onenote/sections/{segment(section_id)}/pages"
+        if parts:
+            files = [("Presentation", (None, html.encode("utf-8"), "text/html"))]
+            files += [(p.name, (p.name, p.data, p.content_type)) for p in parts]
+            resp = await self._request(url, method="POST", files=files)
+        else:
+            resp = await self._request(
+                url, method="POST", content=html.encode("utf-8"),
+                headers={"Content-Type": "text/html"},
+            )
+        return resp.json()
+
+    async def update_page(self, page_id: str, commands: list[dict], parts: list[Part]) -> None:
+        url = f"/me/onenote/pages/{segment(page_id)}/content"
+        if parts:
+            files = [("Commands", (None, json.dumps(commands).encode("utf-8"), "application/json"))]
+            files += [(p.name, (p.name, p.data, p.content_type)) for p in parts]
+            await self._request(url, method="PATCH", files=files)
+        else:
+            await self._request(url, method="PATCH", json=commands)
+
+    async def delete_page(self, page_id: str) -> None:
+        await self._request(f"/me/onenote/pages/{segment(page_id)}", method="DELETE")
+
+    async def copy_page(self, page_id: str, section_id: str, timeout: float = 120.0) -> str:
+        """Copy a page server-side (full fidelity) and return the new page's ID."""
+        resp = await self._request(
+            f"/me/onenote/pages/{segment(page_id)}/copyToSection",
+            method="POST",
+            json={"id": section_id},
+        )
+        op_url = resp.headers.get("Operation-Location")
+        if not op_url:
+            op_id = (resp.json() if resp.content else {}).get("id")
+            if not op_id:
+                raise GraphError("Microsoft Graph accepted the copy but gave no way to track it.")
+            op_url = f"/me/onenote/operations/{segment(op_id)}"
+        waited = 0.0
+        delay = 1.0
+        while waited < timeout:
+            await self._sleep(delay)
+            waited += delay
+            op = await self.get_json(op_url)
+            status = (op.get("status") or "").lower()
+            if status == "completed":
+                new_id = op.get("resourceId")
+                if not new_id:
+                    raise GraphError("The page copy finished but Graph did not return the new page ID.")
+                return new_id
+            if status == "failed":
+                detail = (op.get("error") or {}).get("message") or "no details"
+                raise GraphError(f"Copying the page failed: {detail}")
+            delay = min(delay * 1.5, 5.0)
+        raise GraphError("Copying the page is taking too long; check OneNote for a copy before retrying.")

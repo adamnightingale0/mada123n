@@ -111,3 +111,76 @@ async def test_max_items_reports_truncation():
     client, _, _ = make_client()
     pages, more = await client.section_pages("s", 3)
     assert len(pages) == 3 and more
+
+
+# -- writes ----------------------------------------------------------------
+
+from onenote_mcp.graph import Part  # noqa: E402
+
+
+@respx.mock
+async def test_copy_page_polls_operation():
+    respx.post(f"{GRAPH_BASE}/me/onenote/pages/p1/copyToSection").mock(
+        return_value=httpx.Response(202, headers={"Operation-Location": f"{GRAPH_BASE}/me/onenote/operations/op1"},
+                                    json={"id": "op1", "status": "NotStarted"})
+    )
+    respx.get(f"{GRAPH_BASE}/me/onenote/operations/op1").mock(side_effect=[
+        httpx.Response(200, json={"status": "Running"}),
+        httpx.Response(200, json={"status": "Completed", "resourceId": "p2"}),
+    ])
+    client, _, _ = make_client()
+    assert await client.copy_page("p1", "s1") == "p2"
+    sent = respx.calls[0].request
+    assert sent.method == "POST" and b'"id":"s1"' in sent.content.replace(b" ", b"")
+
+
+@respx.mock
+async def test_copy_page_failure_is_reported():
+    respx.post(f"{GRAPH_BASE}/me/onenote/pages/p1/copyToSection").mock(
+        return_value=httpx.Response(202, json={"id": "op1"})
+    )
+    respx.get(f"{GRAPH_BASE}/me/onenote/operations/op1").mock(
+        return_value=httpx.Response(200, json={"status": "Failed", "error": {"message": "nope"}})
+    )
+    client, _, _ = make_client()
+    with pytest.raises(GraphError, match="nope"):
+        await client.copy_page("p1", "s1")
+
+
+@respx.mock
+async def test_writes_retry_429_but_not_5xx():
+    route = respx.patch(f"{GRAPH_BASE}/me/onenote/pages/p1/content").mock(side_effect=[
+        httpx.Response(429, headers={"Retry-After": "1"}),
+        httpx.Response(503),
+    ])
+    client, _, sleeps = make_client()
+    with pytest.raises(GraphError) as exc:
+        await client.update_page("p1", [{"target": "body", "action": "append", "content": "<p>x</p>"}], [])
+    assert exc.value.status == 503 and route.call_count == 2 and sleeps == [1.0]
+
+
+@respx.mock
+async def test_create_page_multipart_with_image():
+    route = respx.post(f"{GRAPH_BASE}/me/onenote/sections/s1/pages").mock(
+        return_value=httpx.Response(201, json={"id": "new"})
+    )
+    client, _, _ = make_client()
+    page = await client.create_page("s1", "<html><body><img src='name:img1'/></body></html>",
+                                    [Part("img1", b"\x89PNG", "image/png")])
+    assert page["id"] == "new"
+    req = route.calls[0].request
+    assert req.headers["Content-Type"].startswith("multipart/form-data")
+    assert b'name="Presentation"' in req.content and b'name="img1"' in req.content
+
+
+@respx.mock
+async def test_create_page_plain_html_and_patch_json():
+    create = respx.post(f"{GRAPH_BASE}/me/onenote/sections/s1/pages").mock(
+        return_value=httpx.Response(201, json={"id": "new"})
+    )
+    patch = respx.patch(f"{GRAPH_BASE}/me/onenote/pages/new/content").mock(return_value=httpx.Response(204))
+    client, _, _ = make_client()
+    await client.create_page("s1", "<html></html>", [])
+    await client.update_page("new", [{"target": "title", "action": "replace", "content": "T"}], [])
+    assert create.calls[0].request.headers["Content-Type"] == "text/html"
+    assert patch.calls[0].request.headers["Content-Type"] == "application/json"

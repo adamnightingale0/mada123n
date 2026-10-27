@@ -22,7 +22,8 @@ APP_NAME = "onenote-mcp"
 # personal-only.
 DEFAULT_AUTHORITY = "consumers"
 
-GRAPH_SCOPES = ["https://graph.microsoft.com/Notes.Read"]
+READ_SCOPES = ["https://graph.microsoft.com/Notes.Read"]
+WRITE_SCOPES = ["https://graph.microsoft.com/Notes.ReadWrite"]
 
 
 class ConfigError(Exception):
@@ -44,10 +45,21 @@ def app_dir() -> Path:
 
 
 @dataclass(frozen=True)
+class Flags:
+    allow_write: bool = False
+    allow_delete: bool = False
+
+
+@dataclass(frozen=True)
 class Settings:
     client_id: str
     authority: str
     token_cache_path: Path
+    flags: Flags = Flags()
+
+    @property
+    def scopes(self) -> list[str]:
+        return WRITE_SCOPES if self.flags.allow_write else READ_SCOPES
 
     @property
     def authority_url(self) -> str:
@@ -66,6 +78,20 @@ def _read_config_file(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a JSON object")
     return data
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_flags() -> Flags:
+    """Write and delete are opt-in, via ONENOTE_ALLOW_WRITE / ONENOTE_ALLOW_DELETE."""
+    file_cfg = _read_config_file(app_dir() / "config.json")
+    write = _truthy(os.environ.get("ONENOTE_ALLOW_WRITE", file_cfg.get("allow_write")))
+    delete = _truthy(os.environ.get("ONENOTE_ALLOW_DELETE", file_cfg.get("allow_delete")))
+    return Flags(allow_write=write, allow_delete=write and delete)
 
 
 def load_settings() -> Settings:
@@ -87,4 +113,6 @@ def load_settings() -> Settings:
     cache = os.environ.get("ONENOTE_TOKEN_CACHE") or file_cfg.get("token_cache")
     cache_path = Path(cache).expanduser() if cache else base / "token_cache.json"
 
-    return Settings(client_id=client_id, authority=authority, token_cache_path=cache_path)
+    return Settings(
+        client_id=client_id, authority=authority, token_cache_path=cache_path, flags=load_flags()
+    )

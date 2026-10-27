@@ -8,6 +8,7 @@ dependencies = [
     "anyio>=4",
     "beautifulsoup4>=4.12",
     "httpx>=0.27",
+    "markdown-it-py>=3",
     "markdownify>=1.0",
     "mcp>=2.3,<3",
     "msal>=1.31",

@@ -57,6 +57,10 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"Client ID:   {settings.client_id}")
     print(f"Authority:   {settings.authority_url}")
     print(f"Token cache: {settings.token_cache_path}")
+    mode = "read-only"
+    if settings.flags.allow_write:
+        mode = "read/write" + (" + delete" if settings.flags.allow_delete else "")
+    print(f"Mode:        {mode} (scope {settings.scopes[0].rsplit('/', 1)[-1]})")
     auth = Authenticator(settings)
     try:
         auth.get_token()
@@ -85,7 +89,7 @@ def server_entry() -> dict:
     """Launch with this interpreter so Claude Desktop needn't find uv on its PATH."""
     settings = load_settings()
     env = {"ONENOTE_CLIENT_ID": settings.client_id, "ONENOTE_AUTHORITY": settings.authority}
-    for key in ("ONENOTE_TOKEN_CACHE", "ONENOTE_MCP_HOME"):
+    for key in ("ONENOTE_TOKEN_CACHE", "ONENOTE_MCP_HOME", "ONENOTE_ALLOW_WRITE", "ONENOTE_ALLOW_DELETE"):
         if os.environ.get(key):
             env[key] = os.environ[key]
     return {"command": sys.executable, "args": ["-m", "onenote_mcp"], "env": env}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import MarkdownConverter
@@ -119,4 +120,60 @@ def render_page(html: str, page_id: str, max_chars: int) -> str:
         )
     else:
         lines.append(body)
+    return "\n".join(lines)
+
+
+# -- page structure (element IDs for targeted edits) -----------------------
+
+STRUCTURE_TAGS = {"div", "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "img", "object", "iframe"}
+
+
+@dataclass
+class Element:
+    target: str
+    tag: str
+    depth: int
+    preview: str
+
+
+def _preview(el: Tag) -> str:
+    if el.name == "img":
+        return f"[Image: {el.get('alt', '')}]".replace(": ]", "]")
+    if el.name == "object":
+        return f"[Attachment: {el.get('data-attachment', 'file')}]"
+    text = " ".join(el.get_text(" ", strip=True).split())
+    return text[:80] + ("…" if len(text) > 80 else "")
+
+
+def page_structure(html: str) -> list[Element]:
+    """Elements that edits can target, from page HTML fetched with includeIDs=true."""
+    soup = BeautifulSoup(html, "html.parser")
+    body = soup.body or soup
+    out: list[Element] = []
+    for el in body.find_all(STRUCTURE_TAGS):
+        target = el.get("id") or (f"#{el['data-id']}" if el.get("data-id") else None)
+        if not target:
+            continue
+        depth = sum(
+            1 for parent in el.parents
+            if isinstance(parent, Tag) and parent.name in STRUCTURE_TAGS
+            and (parent.get("id") or parent.get("data-id"))
+        )
+        out.append(Element(target, el.name, depth, _preview(el)))
+    return out
+
+
+def render_structure(html: str, page_id: str) -> str:
+    _, title, _ = html_to_markdown(html)
+    elements = page_structure(html)
+    lines = [
+        f"# {title or '(untitled page)'}",
+        f"Page ID: {page_id}",
+        "",
+        "Targets for edits (use the value in backticks as target_id; `title` is the page title):",
+    ]
+    for i, e in enumerate(elements, 1):
+        lines.append(f"{'  ' * e.depth}{i}. {e.tag} `{e.target}` {e.preview}".rstrip())
+    if not elements:
+        lines.append("(no targetable elements; use position=end to add content)")
     return "\n".join(lines)

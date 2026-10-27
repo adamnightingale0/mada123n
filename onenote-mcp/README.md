@@ -1,11 +1,12 @@
 # onenote-mcp
 
-A local, **read-only** [MCP](https://modelcontextprotocol.io) server that lets Claude read your
-Microsoft OneNote notebooks through Microsoft Graph. It runs on your machine over stdio, for
-Claude Desktop and Claude Code.
+A local [MCP](https://modelcontextprotocol.io) server that lets Claude read, and optionally
+edit, your Microsoft OneNote notebooks through Microsoft Graph. It runs on your machine over
+stdio, for Claude Desktop and Claude Code. It is **read-only unless you turn editing on**.
 
-- Signs in with the MSAL **device code flow** using the delegated `Notes.Read` scope, so it can
-  only see the notebooks of the account that signs in.
+- Signs in with the MSAL **device code flow** using delegated permissions (`Notes.Read`, or
+  `Notes.ReadWrite` when editing is on), so it can only reach the notebooks of the account
+  that signs in.
 - Caches the token locally (owner-only file permissions), so you sign in once.
 - Converts OneNote page HTML to clean Markdown.
 - Logs to stderr only; stdout is reserved for MCP JSON-RPC.
@@ -22,8 +23,73 @@ Claude Desktop and Claude Code.
 | `list_pages(section_id, limit=100)` | Page titles, IDs and dates, newest first |
 | `get_page_content(page_id, max_chars=40000)` | One page as Markdown |
 | `search_pages(query, limit=25)` | Pages whose **title** contains all the words (checks the 1,000 most recently modified pages) |
+| `get_page_structure(page_id)` | A page's paragraphs, headings, lists, tables and images with their element IDs |
 
-All tools are marked read-only.
+These tools are always available and only read. The editing tools are below.
+
+## Editing (optional)
+
+Turn editing on with `ONENOTE_ALLOW_WRITE=1` (or `"allow_write": true` in `config.json`).
+
+| Tool | What it does |
+| --- | --- |
+| `create_page(section_id, title, content)` | New page from Markdown |
+| `create_section(notebook_id, name)` | New section |
+| `add_content(page_id, content, position, target_id)` | Add Markdown at the end or start of the page, or before/after an element |
+| `replace_content(page_id, target_id, content)` | Rewrite or reformat one paragraph, heading, list, table or image |
+| `set_page_title(page_id, title)` | Rename a page |
+| `insert_image(page_id, source, alt_text, width, position, target_id)` | Image from a local file (png/jpg/gif/bmp/tiff, ≤ 25 MB) or a URL |
+| `attach_file(page_id, path, position, target_id)` | Attach a local file (≤ 25 MB) |
+| `restore_previous_version(page_id)` | Undo the most recent edit (see below) |
+| `delete_page(page_id)` | Only when `ONENOTE_ALLOW_DELETE=1` is also set |
+
+Content is Markdown: headings, bold/italic/strikethrough, lists, `- [ ]` / `- [x]` to-dos
+(they become OneNote to-do tags), tables, links, and `![alt](path or URL)` images. For
+formatting Markdown can't express, a little inline HTML is allowed: `<u>`, `<sub>`, `<sup>`
+and `<span style="…">` with colour, highlight (`background-color`), font, size, weight, style
+or decoration. Any other HTML is stripped before it reaches OneNote.
+
+**How your originals are protected**
+
+- **Copy on first edit.** The first time Claude edits an existing page, the server copies it
+  into the same section as **"<title> [edited]"**, and that edit and every later one go to the
+  copy. Your original stays exactly as it was, next to the copy, for comparison. The copy is
+  made by OneNote itself (`copyToSection`), so ink, drawings and attachments come along. If
+  that feature isn't available to your account, the server rebuilds the copy from the page's
+  HTML instead and says so; that version loses ink.
+- **The original→copy link is remembered** in `edit_state.json` in the app directory, so
+  later chats keep editing the same copy. If you delete the copy in OneNote, the next edit
+  makes a fresh one. Pages Claude creates itself are edited directly; they need no copy.
+- **One snapshot per page.** Before each edit, the server saves the page's HTML to
+  `snapshots/` in the app directory, overwriting the previous snapshot for that page. Only
+  text and markup are saved, not image data, so the files are small. `restore_previous_version`
+  rebuilds the page as it was before the last edit, as a new page next to the broken one
+  (delete that one yourself once you've checked). It's a one-step undo, not a history.
+- Claude Desktop asks before each tool call that changes something, unless you've chosen
+  "always allow".
+
+**Turning it on**
+
+1. In Azure → your app → **API permissions** → Add a permission → Microsoft Graph →
+   Delegated → **`Notes.ReadWrite`**. (You can then remove `Notes.Read`.)
+2. Sign in again so you consent to the new permission:
+   ```powershell
+   $env:ONENOTE_CLIENT_ID="<id>"; $env:ONENOTE_ALLOW_WRITE="1"
+   uv run onenote-mcp logout
+   uv run onenote-mcp login
+   uv run onenote-mcp status      # Mode: read/write (scope Notes.ReadWrite)
+   ```
+3. Run `uv run onenote-mcp desktop-config --write` in the same window (it copies
+   `ONENOTE_ALLOW_WRITE` into the config) and restart Claude Desktop.
+
+**Editing limits**
+
+- Handwriting/ink can't be edited, and positions on the page can't be changed.
+- Claude can't see what you've selected in OneNote; point at text by page and wording, e.g.
+  "rewrite the paragraph starting 'Budget for…' on my Trip page".
+- Images pasted into the Claude chat can't be passed to OneNote; give a file path or URL.
+- Edits show up after OneNote syncs, usually within a minute.
+- Sections and notebooks can't be renamed or deleted, and subpages can't be created.
 
 ## 1. Register an app in Azure (one-off, manual)
 
@@ -79,6 +145,8 @@ or create `config.json` in the app directory (see below):
 | Token cache file | `ONENOTE_TOKEN_CACHE` | `token_cache` | `<app dir>/token_cache.json` |
 | App directory | `ONENOTE_MCP_HOME` | – | see below |
 | Log level | `ONENOTE_LOG_LEVEL` | – | `INFO` |
+| Allow editing | `ONENOTE_ALLOW_WRITE` | `allow_write` | off |
+| Allow page deletion | `ONENOTE_ALLOW_DELETE` | `allow_delete` | off (needs editing on) |
 
 App directory: macOS `~/Library/Application Support/onenote-mcp/`, Windows
 `%LOCALAPPDATA%\onenote-mcp\`, Linux `~/.config/onenote-mcp/`. It's outside the repo, so the
@@ -143,15 +211,18 @@ uv run pytest
 The tests mock Graph and MSAL, so they need no account or network.
 
 Layout: `config.py` (settings), `auth.py` (MSAL + token cache), `graph.py` (HTTP, paging,
-retries), `convert.py` (HTML → Markdown), `server.py` (MCP tools), `cli.py` (commands).
+retries, writes), `convert.py` (HTML → Markdown, page structure), `compose.py` (Markdown →
+OneNote HTML, images/files), `editing.py` (copy on first edit, snapshots, restore),
+`state.py` (local edit state), `server.py` (MCP tools), `cli.py` (commands).
 
 The server uses MCP Python SDK 2.x. FastMCP was renamed `MCPServer` in that release
 (`from mcp.server.mcpserver import MCPServer`), with the same decorator-based API.
 
 ## Errors and throttling
 
-- **429 / 502 / 503 / 504:** the server retries up to 3 times. It honours `Retry-After`, with
-  each wait capped at 30 s. If Graph is still throttling after that, Claude gets a message
+- **429 / 502 / 503 / 504:** the server retries reads up to 3 times. It honours
+  `Retry-After`, with each wait capped at 30 s. Edits are retried only on 429, since a server
+  error during an edit may have half-applied it and a retry could duplicate content. If Graph is still throttling after that, Claude gets a message
   telling it to wait and slow down.
 - **401:** the server forces one token refresh and retries. If that fails, run
   `onenote-mcp logout` and sign in again.
@@ -173,5 +244,4 @@ The server uses MCP Python SDK 2.x. FastMCP was renamed `MCPServer` in that rele
 
 ## Possible later additions
 
-- Write tools (`create_page`, `append_to_page`) with `Notes.ReadWrite`.
 - A hosted remote connector (HTTPS + proper OAuth) for claude.ai web/mobile.
