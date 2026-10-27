@@ -33,14 +33,19 @@ class FakeOneNote:
 
     async def page(self, page_id):
         p = self._get(page_id)
-        return {"id": page_id, "title": p["title"], "parentSection": {"id": p["section"]}}
+        return {"id": page_id, "title": p["title"], "parentSection": {"id": p["section"]},
+                "links": {"oneNoteClientUrl": {"href": f"onenote:https://x/{page_id}"}}}
 
     async def page_content(self, page_id, include_ids=False):
         p = self._get(page_id)
         html = page_doc(p["title"], p["paragraphs"], page_id)
         if not include_ids:
             html = html.replace(' id="', ' data-x="')
-        return html + f'<img src="{GRAPH}/me/onenote/resources/r1/$value" alt="pic">'
+        return html + (
+            f'<object data-attachment="Topic_2.pdf" type="application/pdf" '
+            f'data="{GRAPH}/me/onenote/resources/r2/$value"></object>'
+            f'<img src="{GRAPH}/me/onenote/resources/r1/$value" alt="pic">'
+        )
 
     async def copy_page(self, page_id, section_id):
         if not self.copy_supported:
@@ -66,6 +71,8 @@ class FakeOneNote:
                 p["title"] = c["content"]
 
     async def get_bytes(self, url):
+        if url.endswith("r2/$value"):
+            return b"%PDF", "application/pdf"
         return b"\x89PNG", "image/png"
 
     async def delete_page(self, page_id):

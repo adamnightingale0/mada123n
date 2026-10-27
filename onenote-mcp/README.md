@@ -21,7 +21,7 @@ stdio, for Claude Desktop and Claude Code. It is **read-only unless you turn edi
 | `list_notebooks` | Your notebooks, with IDs |
 | `list_sections(notebook_id)` | Every section, including those inside section groups (shown as `Group / Section`) |
 | `list_pages(section_id, limit=100)` | Page titles, IDs and dates, newest first |
-| `get_page_content(page_id, max_chars=40000)` | One page as Markdown |
+| `get_page_content(page_id, max_chars=40000, image_text=true)` | One page as Markdown. Typed text comes first; text recognised in images (e.g. lecture-slide printouts) is listed at the end, or left out with `image_text=false` |
 | `search_pages(query, limit=25)` | Pages whose **title** contains all the words (checks the 1,000 most recently modified pages) |
 | `get_page_structure(page_id)` | A page's paragraphs, headings, lists, tables and images with their element IDs |
 
@@ -33,6 +33,7 @@ Turn editing on with `ONENOTE_ALLOW_WRITE=1` (or `"allow_write": true` in `confi
 
 | Tool | What it does |
 | --- | --- |
+| `copy_page(page_id, target_section_id, new_title)` | Duplicate a page with everything on it (slide printouts, images, attachments, ink). The first copy of a page becomes its working copy |
 | `create_page(section_id, title, content)` | New page from Markdown |
 | `create_section(notebook_id, name)` | New section |
 | `add_content(page_id, content, position, target_id)` | Add Markdown at the end or start of the page, or before/after an element |
@@ -51,14 +52,17 @@ or decoration. Any other HTML is stripped before it reaches OneNote.
 
 **How your originals are protected**
 
-- **Copy on first edit.** The first time Claude edits an existing page, the server copies it
-  into the same section as **"<title> [edited]"**, and that edit and every later one go to the
-  copy. Your original stays exactly as it was, next to the copy, for comparison. The copy is
+- **Originals are never edited.** Claude is told to call `copy_page` before working on an
+  existing page, and then edits the copy. If it edits an original's ID anyway, the server
+  first copies the page into the same section as **"<title> [edited]"**, and that edit and
+  every later one go to the copy. Your original stays exactly as it was, next to the copy, for comparison. The copy is
   made by OneNote itself (`copyToSection`), so ink, drawings and attachments come along. If
   that feature isn't available to your account, the server rebuilds the copy from the page's
-  HTML instead and says so; that version loses ink.
+  HTML instead, re-uploading every image and attached file (including PDF printouts), and
+  says so; that version loses ink.
 - **The original→copy link is remembered** in `edit_state.json` in the app directory, so
-  later chats keep editing the same copy. If you delete the copy in OneNote, the next edit
+  later chats keep editing the same copy. `list_pages` marks originals, working copies and
+  pages Claude created. If you delete the copy in OneNote, the next edit
   makes a fresh one. Pages Claude creates itself are edited directly; they need no copy.
 - **One snapshot per page.** Before each edit, the server saves the page's HTML to
   `snapshots/` in the app directory, overwriting the previous snapshot for that page. Only

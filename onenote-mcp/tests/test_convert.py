@@ -26,7 +26,7 @@ def test_converts_onenote_markup():
     assert "[ ] Buy milk" in md
     assert "[x] [Important] Call home" in md
     assert "- [Question] two?" in md
-    assert "[Image: A cat]" in md
+    assert "[Image 1: A cat]" in md
     assert "[Attachment: Plan.pdf]" in md
     assert "| a | b |\n| --- | --- |\n| 1 | 2 |" in md
     assert "Second outline" in md
@@ -43,3 +43,20 @@ def test_render_includes_header_and_truncates():
 def test_empty_page_explains_ink():
     out = render_page("<html><head><title>Ink</title></head><body><div></div></body></html>", "p", 1000)
     assert EMPTY_PAGE_NOTE in out
+
+
+def test_long_image_text_moves_after_typed_notes():
+    slide = "TOPIC 2 Monoclonal Antibodies " * 10
+    html = (
+        "<html><head><title>L2</title></head><body><div>"
+        f'<object data-attachment="Topic_2.pdf"></object><img alt="{slide}"/><img alt="Logo"/>'
+        "<ul><li>Rituximab targets CD20</li></ul></div></body></html>"
+    )
+    md, _, _ = html_to_markdown(html)
+    assert "[Attachment: Topic_2.pdf]" in md
+    assert "[Image 1, text below]" in md and "[Image 2: Logo]" in md
+    assert md.index("Rituximab") < md.index("## Text found in images (OCR)") < md.index("**Image 1:** TOPIC 2")
+
+    short, _, _ = html_to_markdown(html, image_text=False)
+    assert "TOPIC 2" not in short and "Text from 1 image(s) left out" in short
+    assert "Rituximab" in short

@@ -58,14 +58,35 @@ class Editor:
         else:
             notes = []
 
+        copy_id, title, fidelity = await self.make_copy(page_id, title_suffix=COPY_SUFFIX)
+        # Record the link first, so a failure below can't lead to a second copy on retry.
+        self.state.set_copy(page_id, copy_id)
+        notes.append(
+            f"First edit of this page: made {fidelity} named '{title}' in the same section "
+            f"(id: {copy_id}). The original page is unchanged; all edits go to the copy."
+        )
+        return copy_id, page_id, notes
+
+    async def make_copy(
+        self,
+        page_id: str,
+        section_id: str | None = None,
+        new_title: str | None = None,
+        title_suffix: str = "",
+    ) -> tuple[str, str, str]:
+        """Copy a page, preferring OneNote's exact server-side copy.
+
+        Returns (new page ID, its title, a description of how faithful the copy is).
+        """
         meta = await self.graph.page(page_id)
-        section_id = (meta.get("parentSection") or {}).get("id")
+        source_section = (meta.get("parentSection") or {}).get("id")
+        section_id = section_id or source_section
         if not section_id:
             raise EditError("Couldn't find the section this page is in.")
-        title = meta.get("title") or "Untitled"
+        title = new_title or (meta.get("title") or "Untitled") + title_suffix
         try:
             copy_id = await self.graph.copy_page(page_id, section_id)
-            fidelity = "an exact copy"
+            fidelity = "an exact copy (slides, printouts, attachments and ink included)"
         except GraphError as exc:
             if exc.status not in COPY_FALLBACK_STATUSES:
                 raise
@@ -73,23 +94,46 @@ class Editor:
             html = await self.graph.page_content(page_id)
             copy_id = await self.create_from_html(section_id, html, title)
             fidelity = (
-                "a copy rebuilt from the page's HTML (Microsoft's exact-copy feature wasn't "
-                "available, so handwriting/ink and drawings were not copied)"
+                "a copy rebuilt from the page's content, re-uploading its images and attached "
+                "files (Microsoft's exact-copy feature wasn't available, so handwriting/ink "
+                "and drawings were not copied)"
             )
-        # Record the link first, so a failure below can't lead to a second copy on retry.
-        self.state.set_copy(page_id, copy_id)
         try:
             await self.graph.update_page(
-                copy_id, [{"target": "title", "action": "replace", "content": title + COPY_SUFFIX}], []
+                copy_id, [{"target": "title", "action": "replace", "content": title}], []
             )
         except GraphError as exc:
-            log.warning("Could not rename working copy: %s", exc)
-            notes.append(f"(The copy couldn't be renamed, so it has the same title as the original: {exc})")
-        notes.append(
-            f"First edit of this page: made {fidelity} named '{title}{COPY_SUFFIX}' in the same "
-            f"section (id: {copy_id}). The original page is unchanged; all edits go to the copy."
+            log.warning("Could not rename copy: %s", exc)
+            title = meta.get("title") or "Untitled"
+            fidelity += f" (it couldn't be renamed, so it has the original's title: {exc})"
+        return copy_id, title, fidelity
+
+    async def copy_page(
+        self, page_id: str, section_id: str | None, new_title: str | None
+    ) -> tuple[str, str]:
+        """Explicit copy. The first copy of a page becomes its working copy.
+
+        Returns (new page ID, message).
+        """
+        copy_id, title, fidelity = await self.make_copy(
+            page_id, section_id, new_title, title_suffix=" (copy)"
         )
-        return copy_id, page_id, notes
+        if self.state.is_working_page(page_id):
+            self.state.add_created(copy_id)
+            role = "It is a separate page; edit it by its ID."
+        elif self.state.copy_of(page_id):
+            self.state.add_created(copy_id)
+            role = (
+                f"The page already had a working copy ({self.state.copy_of(page_id)}), which "
+                "still receives edits made with the original's ID. Edit this copy by its ID."
+            )
+        else:
+            self.state.set_copy(page_id, copy_id)
+            role = (
+                "It is now this page's working copy: edits made with either ID go to the copy, "
+                "and the original stays unchanged."
+            )
+        return copy_id, f"Made {fidelity}: '{title}' (id: {copy_id}). {role}"
 
     async def create_from_html(self, section_id: str, html: str, title: str) -> str:
         """Create a page from existing page HTML, re-uploading its images and files."""

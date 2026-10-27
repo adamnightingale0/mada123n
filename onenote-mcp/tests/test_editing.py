@@ -74,8 +74,10 @@ async def test_falls_back_to_html_copy(tmp_path):
     prep = await ed.prepare(orig, None)
     assert "ink" in prep.notes[0]
     section, html, parts = fake.created[0]
-    assert section == "sec1" and 'src="name:img1"' in html and parts[0].data == b"\x89PNG"
-    assert ' id="' not in html
+    assert section == "sec1" and 'src="name:img1"' in html and ' id="' not in html
+    # The PDF printout's attachment is re-uploaded along with the slide images.
+    assert 'data="name:file2"' in html and 'data-attachment="Topic_2.pdf"' in html
+    assert {p.name: p.data for p in parts} == {"img1": b"\x89PNG", "file2": b"%PDF"}
 
 
 async def test_created_pages_are_edited_directly(setup):
@@ -99,3 +101,17 @@ async def test_restore_rebuilds_from_snapshot(setup):
     assert copy in msg and "delete it" in msg
     with pytest.raises(EditError):
         await ed.restore(fake.add_page("Untouched", []))
+
+
+async def test_explicit_copy_becomes_working_copy_once(setup):
+    fake, state, ed = setup
+    orig = fake.add_page("L2", ["notes"])
+    first, msg = await ed.copy_page(orig, None, None)
+    assert fake.pages[first]["title"] == "L2 (copy)" and "exact copy" in msg
+    assert state.copy_of(orig) == first and "working copy" in msg
+    # Edits via the original now land on that copy, without another copy.
+    assert (await ed.prepare(orig, None)).page_id == first
+
+    second, msg = await ed.copy_page(orig, "sec2", "Revision")
+    assert fake.pages[second] == {"title": "Revision", "section": "sec2", "paragraphs": ["notes"]}
+    assert state.copy_of(orig) == first and second in state.created and "already had" in msg

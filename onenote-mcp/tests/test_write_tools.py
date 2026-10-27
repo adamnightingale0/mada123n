@@ -99,3 +99,23 @@ async def test_restore_and_delete_gating(tmp_path):
     async with Client(server) as c:
         r = await c.call_tool("delete_page", {"page_id": pid})
     assert fake.deleted == [pid] and "Deleted" in text(r)
+
+
+async def test_copy_page_tool_and_page_markers(tmp_path):
+    fake, state, server = make(tmp_path)
+    orig = fake.add_page("L2", ["notes"])
+
+    async def section_pages(section_id, max_items):
+        return [{"id": pid, "title": p["title"]} for pid, p in fake.pages.items()], False
+
+    fake.section_pages = section_pages
+    async with Client(server) as c:
+        tools = {t.name: t for t in (await c.list_tools()).tools}
+        assert not tools["copy_page"].annotations.destructive_hint
+        assert "Never changes an original page" in tools["replace_content"].description
+        r = await c.call_tool("copy_page", {"page_id": orig})
+        copy = state.copy_of(orig)
+        assert copy in text(r) and "Open in OneNote: onenote:" in text(r)
+        listing = text(await c.call_tool("list_pages", {"section_id": "sec1"}))
+    assert f"original, edits go to working copy {copy}" in listing
+    assert f"working copy of {orig}" in listing

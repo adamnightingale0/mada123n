@@ -30,10 +30,27 @@ EMPTY_PAGE_NOTE = (
 )
 
 
+# Alt text up to this length is shown inline; longer alt text is usually OCR of a slide or
+# printout, which is listed after the page text so typed notes stay easy to find.
+INLINE_ALT_CHARS = 80
+
+
 class _OneNoteConverter(MarkdownConverter):
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.image_count = 0
+        self.image_text: list[tuple[int, str]] = []
+
     def convert_img(self, el, text, parent_tags=None, **kwargs):
-        alt = (el.get("alt") or "").strip()
-        return f" [Image: {alt}] " if alt else " [Image] "
+        self.image_count += 1
+        n = self.image_count
+        alt = " ".join((el.get("alt") or "").split())
+        if not alt:
+            return f" [Image {n}] "
+        if len(alt) <= INLINE_ALT_CHARS:
+            return f" [Image {n}: {alt}] "
+        self.image_text.append((n, alt))
+        return f" [Image {n}, text below] "
 
 
 def _tag_prefix(value: str) -> str:
@@ -81,8 +98,12 @@ def _preprocess(soup: BeautifulSoup) -> None:
         el.insert_after(NavigableString("\n\n"))
 
 
-def html_to_markdown(html: str) -> tuple[str, str | None, str | None]:
-    """Convert page HTML. Returns (markdown_body, title, created)."""
+def html_to_markdown(html: str, image_text: bool = True) -> tuple[str, str | None, str | None]:
+    """Convert page HTML. Returns (markdown_body, title, created).
+
+    Long image text (OCR of slides/printouts) goes in a section after the page text,
+    or is left out when ``image_text`` is false.
+    """
     soup = BeautifulSoup(html, "html.parser")
     title_el = soup.find("title")
     title = title_el.get_text(strip=True) if title_el else None
@@ -94,16 +115,29 @@ def html_to_markdown(html: str) -> tuple[str, str | None, str | None]:
         soup.head.decompose()
     _preprocess(soup)
 
-    md = _OneNoteConverter(heading_style="ATX", bullets="-", table_infer_header=True, strip=["span", "font"]).convert_soup(body)
+    conv = _OneNoteConverter(
+        heading_style="ATX", bullets="-", table_infer_header=True, escape_underscores=False,
+        strip=["span", "font"],
+    )
+    md = conv.convert_soup(body)
     md = md.replace(" ", " ")
     md = re.sub(r"[ \t]+\n", "\n", md)
     md = re.sub(r"^ (\[Image)", r"\1", md, flags=re.MULTILINE)
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    if conv.image_text:
+        if image_text:
+            ocr = "\n\n".join(f"**Image {n}:** {text}" for n, text in conv.image_text)
+            md += f"\n\n## Text found in images (OCR)\n\n{ocr}"
+        else:
+            md += (
+                f"\n\n_[Text from {len(conv.image_text)} image(s) left out; call again with "
+                "image_text=true to include it.]_"
+            )
     return md, title, created
 
 
-def render_page(html: str, page_id: str, max_chars: int) -> str:
-    body, title, created = html_to_markdown(html)
+def render_page(html: str, page_id: str, max_chars: int, image_text: bool = True) -> str:
+    body, title, created = html_to_markdown(html, image_text)
     lines = [f"# {title or '(untitled page)'}", "", f"Page ID: {page_id}"]
     if created:
         lines.append(f"Created: {created}")
@@ -138,7 +172,9 @@ class Element:
 
 def _preview(el: Tag) -> str:
     if el.name == "img":
-        return f"[Image: {el.get('alt', '')}]".replace(": ]", "]")
+        alt = " ".join((el.get("alt") or "").split())
+        alt = alt[:60] + ("…" if len(alt) > 60 else "")
+        return f"[Image: {alt}]" if alt else "[Image]"
     if el.name == "object":
         return f"[Attachment: {el.get('data-attachment', 'file')}]"
     text = " ".join(el.get_text(" ", strip=True).split())

@@ -42,9 +42,12 @@ Editing is enabled. Content is written as Markdown (headings, bold/italic, lists
 can't express, inline HTML is allowed: <u>, <sub>, <sup>, and <span style="..."> with
 color, background-color (highlight), font-size, font-family, font-weight, font-style or
 text-decoration. Other HTML is removed.
-- The first edit to an existing page makes a copy titled "<title> [edited]" in the same
-  section; that edit and all later ones go to the copy, so the original stays as it was.
-  Tell the user when a copy is made.
+- Original pages are never edited. To work on an existing page, call copy_page first
+  and edit the copy's ID; this copies everything, including slide printouts, attached
+  files and ink. (Editing an original's ID also works: the server makes the copy itself,
+  titled "<title> [edited]", and edits that.) Tell the user the copy's name.
+- Never rebuild an existing page with create_page; it can't carry over images,
+  printouts or attachments. Use copy_page.
 - To change specific text, call get_page_structure first and use an element ID as
   target_id. Prefer replacing individual elements over rewriting the whole page.
 - Before each edit the server saves one snapshot of the page; restore_previous_version
@@ -52,7 +55,9 @@ text-decoration. Other HTML is removed.
 - Edits appear in OneNote after it syncs, usually within a minute."""
 
 Position = Literal["end", "start", "before", "after"]
-PageId = Annotated[str, Field(description="Page ID. Edits to an original page go to its working copy.")]
+PageId = Annotated[
+    str, Field(description="Page ID. If it's an original page, the edit goes to its working copy.")
+]
 TargetId = Annotated[
     str | None, Field(description="Element ID from get_page_structure (needed for before/after)")
 ]
@@ -154,6 +159,11 @@ class OneNoteService:
         return await self.call(run)
 
 
+def _link(page: dict) -> str:
+    href = ((page.get("links") or {}).get("oneNoteClientUrl") or {}).get("href")
+    return f"\nOpen in OneNote: {href}" if href else ""
+
+
 def _fmt_date(value: str | None) -> str:
     return value[:10] if value else "?"
 
@@ -212,12 +222,21 @@ def build_server(service: OneNoteService | None = None, flags: Flags | None = No
         pages, more = await svc.call(lambda g: g.section_pages(section_id, limit))
         if not pages:
             return "This section has no pages."
+        state = svc.editor.state if flags.allow_write else None
         lines = [f"{len(pages)} page(s){' (more exist; raise limit to see them)' if more else ''}:"]
         for p in pages:
+            role = ""
+            if state:
+                if (orig := state.original_of(p["id"])):
+                    role = f"; working copy of {orig}"
+                elif (copy := state.copy_of(p["id"])):
+                    role = f"; original, edits go to working copy {copy}"
+                elif p["id"] in state.created:
+                    role = "; created by Claude"
             lines.append(
                 f"- {p.get('title') or '(untitled)'} (id: {p['id']}; created "
                 f"{_fmt_date(p.get('createdDateTime'))}, modified "
-                f"{_fmt_date(p.get('lastModifiedDateTime'))})"
+                f"{_fmt_date(p.get('lastModifiedDateTime'))}{role})"
             )
         return "\n".join(lines)
 
@@ -227,11 +246,17 @@ def build_server(service: OneNoteService | None = None, flags: Flags | None = No
         max_chars: Annotated[
             int, Field(ge=1000, le=200_000, description="Truncate the page text after this many characters")
         ] = 40_000,
+        image_text: Annotated[
+            bool,
+            Field(description="Include text recognised in images (e.g. lecture slides), listed "
+                              "after the page's typed text. Set false for just the typed notes."),
+        ] = True,
     ) -> str:
-        """Read one page as Markdown. Images and attachments appear as placeholders;
-        handwriting/ink is not included."""
+        """Read one page as Markdown. Typed text comes first; images appear as numbered
+        placeholders and attachments/printouts as [Attachment: name]. Long text recognised in
+        images (slide OCR) is listed at the end. Handwriting/ink is not included."""
         html = await svc.call(lambda g: g.page_content(page_id))
-        return render_page(html, page_id, max_chars)
+        return render_page(html, page_id, max_chars, image_text)
 
     @mcp.tool(annotations=READ_ONLY)
     async def search_pages(
@@ -304,14 +329,35 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
             body = markdown_to_html(content, parts) if content.strip() else ""
             page = await g.create_page(section_id, page_html(title, body), parts.items)
             svc.editor.state.add_created(page["id"])
-            return f"Created page '{title}' (id: {page['id']})."
+            return f"Created page '{title}' (id: {page['id']}).{_link(page)}"
+
+        return await svc.call(run)
+
+    @mcp.tool(annotations=ADDS)
+    async def copy_page(
+        page_id: Annotated[str, Field(description="Page to copy")],
+        target_section_id: Annotated[
+            str | None, Field(description="Section for the copy (default: same section)")
+        ] = None,
+        new_title: Annotated[str | None, Field(description="Default: '<title> (copy)'")] = None,
+    ) -> str:
+        """Duplicate a page, including slide printouts, images, attached files and ink. Does
+        not change the original. Use this before editing an existing page: the first copy of a
+        page becomes its working copy. Returns the new page's ID."""
+
+        async def run(g: GraphClient) -> str:
+            copy_id, message = await svc.editor.copy_page(page_id, target_section_id, new_title)
+            return message + _link(await g.page(copy_id))
 
         return await svc.call(run)
 
     @mcp.tool(annotations=ADDS)
     async def add_content(page_id: PageId, content: Content, position: Pos = "end",
                           target_id: TargetId = None) -> str:
-        """Add Markdown content to a page: at the end or start, or before/after an element."""
+        """Add Markdown content to a page: at the end or start, or before/after an element.
+        Never changes an original page: if page_id is an original, the edit goes to its
+        working copy (made on first edit as '<title> [edited]' in the same section). The
+        result gives the ID of the page that was changed."""
         return await svc.edit(
             page_id, target_id,
             lambda t, parts: [_placement(position, t, markdown_to_html(content, parts))],
@@ -325,7 +371,10 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
         content: Content,
     ) -> str:
         """Replace one element (paragraph, heading, list, table, image or outline) with new
-        Markdown content. Use this to rewrite or reformat existing text."""
+        Markdown content. Use this to rewrite or reformat existing text.
+        Never changes an original page: if page_id is an original, the edit goes to its
+        working copy (made on first edit as '<title> [edited]' in the same section). The
+        result gives the ID of the page that was changed."""
         return await svc.edit(
             page_id, target_id,
             lambda t, parts: [{"target": t, "action": "replace", "content": markdown_to_html(content, parts)}],
@@ -334,7 +383,10 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
 
     @mcp.tool(annotations=CHANGES)
     async def set_page_title(page_id: PageId, title: Annotated[str, Field(min_length=1)]) -> str:
-        """Change a page's title."""
+        """Change a page's title.
+        Never changes an original page: if page_id is an original, the edit goes to its
+        working copy (made on first edit as '<title> [edited]' in the same section). The
+        result gives the ID of the page that was changed."""
         return await svc.edit(
             page_id, "title",
             lambda t, parts: [{"target": "title", "action": "replace", "content": title}],
@@ -350,7 +402,10 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
         position: Pos = "end",
         target_id: TargetId = None,
     ) -> str:
-        """Insert an image from a file on this computer or a public URL."""
+        """Insert an image from a file on this computer or a public URL.
+        Never changes an original page: if page_id is an original, the edit goes to its
+        working copy (made on first edit as '<title> [edited]' in the same section). The
+        result gives the ID of the page that was changed."""
         return await svc.edit(
             page_id, target_id,
             lambda t, parts: [_placement(position, t, image_tag(source, parts, alt_text, width))],
@@ -364,7 +419,10 @@ def _register_write_tools(mcp: MCPServer, svc: OneNoteService, flags: Flags) -> 
         position: Pos = "end",
         target_id: TargetId = None,
     ) -> str:
-        """Attach a file from this computer to a page (shown as a file icon in OneNote)."""
+        """Attach a file from this computer to a page (shown as a file icon in OneNote).
+        Never changes an original page: if page_id is an original, the edit goes to its
+        working copy (made on first edit as '<title> [edited]' in the same section). The
+        result gives the ID of the page that was changed."""
         return await svc.edit(
             page_id, target_id,
             lambda t, parts: [_placement(position, t, attachment_tag(path, parts))],

@@ -268,7 +268,7 @@ class GraphClient:
     async def page(self, page_id: str) -> dict:
         return await self.get_json(
             f"/me/onenote/pages/{segment(page_id)}",
-            {"$select": "id,title", "$expand": "parentSection($select=id,displayName)"},
+            {"$select": "id,title,links", "$expand": "parentSection($select=id,displayName)"},
         )
 
     # -- writes ------------------------------------------------------------
